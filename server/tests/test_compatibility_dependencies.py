@@ -181,7 +181,7 @@ class CompatibilityDependenciesTest(unittest.TestCase):
                 patch.object(manager, "_existing", return_value=("uv", python.parent.parent, python)),
             ):
                 command, env = manager.get_command_and_env(["pdf2zh_next", "paper.pdf", "--openai"])
-            self.assertEqual(command, [str(python), "-u", str(runner), "pdf2zh_next", "paper.pdf", "--openai"])
+            self.assertEqual(command, [str(python), "-u", str(runner.resolve()), "pdf2zh_next", "paper.pdf", "--openai"])
             self.assertEqual(env["PYTHONNOUSERSITE"], "1")
 
 
