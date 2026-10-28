@@ -1,3 +1,5 @@
+import { normalizeChatBaseUrl } from "./apiEndpoints";
+
 export interface LLMServiceConfig {
     name: string;
     models?: string[];
@@ -31,6 +33,7 @@ class LLMApiManager {
         this.data = new Map<string, LLMApiData>();
     }
     public updateLLMApi(llmApi: LLMApiData): string {
+        llmApi.apiUrl = normalizeChatBaseUrl(llmApi.service, llmApi.apiUrl);
         let key = llmApi.key;
         if (!key) {
             key = Zotero.Utilities.generateObjectKey();

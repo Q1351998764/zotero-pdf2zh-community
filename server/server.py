@@ -1,4 +1,4 @@
-## server.py v4.1.7
+## server.py v4.1.8
 # guaguastandup
 # zotero-pdf2zh
 import os
@@ -36,11 +36,12 @@ from utils.auto_update import check_for_updates, fetch_and_show_notices, perform
 from utils.task_manager import task_manager
 # 导入带进度解析的命令执行器
 from utils.execute import execute_with_progress
+from utils.diagnostics import missing_output_error, record_task_error, safe_message, error_summary
 
 _VALUE_ERROR_RE = re.compile(r'(?m)^ValueError:\s*(?P<msg>.+)$')
 
-__version__ = "4.1.7"
-update_log = "远程/Docker 优先 HTTP 挂附件；新旧插件协议兼容；进度条显示翻译百分比；加固附件文件名；补齐额外字段白名单，可从下拉添加 *_enable_json_mode（默认关闭）。请同时更新插件和 Server。"
+__version__ = "4.1.8"
+update_log = "社区维护版：按任务保存脱敏诊断日志，错误原因关联历史记录；修复空响应、旧模型下载路径与运行环境兼容；独立 GitHub 更新源。请同时更新插件和 Server。"
 
 ############# config file #########
 pdf2zh      = 'pdf2zh'
@@ -386,8 +387,8 @@ class PDFTranslator:
                 try:
                     worker()
                 except Exception as exc:
-                    task_manager.complete_task(task_id, 'failed', str(exc), error=str(exc))
-                    self._exception_payload(exc, context=context)
+                    self._record_task_failure(task_id, exc)
+                    self._exception_payload(exc, context=context, task_id=task_id)
 
             threading.Thread(target=run, daemon=True).start()
             return jsonify({'status': 'accepted', 'taskId': task_id}), 200
@@ -404,14 +405,13 @@ class PDFTranslator:
                 }), 500
             return jsonify(payload), 200
         except Exception as exc:
-            task_manager.complete_task(task_id, 'failed', str(exc), error=str(exc))
-            return self._handle_exception(exc, context=context)
+            self._record_task_failure(task_id, exc)
+            return self._handle_exception(exc, context=context, task_id=task_id)
 
     def _complete_job_files(self, task_id, paths, message):
         payload = self._success_files_payload(paths)
         if not payload['fileList']:
-            task_manager.complete_task(task_id, 'failed', '操作失败，请查看详细日志。', error='无文件生成')
-            return {'status': 'error', 'message': '操作失败，请查看详细日志。'}
+            raise missing_output_error(task_id)
         task_manager.complete_task(
             task_id,
             'success',
@@ -514,8 +514,8 @@ class PDFTranslator:
                 '/translate',
             )
         except Exception as e:
-            task_manager.complete_task(task_id, 'failed', str(e), error=str(e))
-            return self._handle_exception(e, context='/translate')
+            self._record_task_failure(task_id, e)
+            return self._handle_exception(e, context='/translate', task_id=task_id)
 
     def _execute_translate_job(self, task_id, input_path, config, engine):
         def addFileList(fileList, filePath):
@@ -630,8 +630,7 @@ class PDFTranslator:
             print(f"🐲 翻译成功, 生成文件: {f}, 大小为: {size/1024.0/1024.0:.2f} MB")
 
         if not existing:
-            task_manager.complete_task(task_id, 'failed', '操作失败，请查看详细日志。', error='无文件生成')
-            return {'status': 'error', 'message': '操作失败，请查看详细日志。'}
+            raise missing_output_error(task_id)
 
         payload = self._success_files_payload(existing)
         task_manager.complete_task(
@@ -645,16 +644,20 @@ class PDFTranslator:
         )
         return payload
 
-    def _handle_exception(self, exc, status_code=500, context=None):
-        return jsonify(self._exception_payload(exc, context=context)), status_code
+    def _record_task_failure(self, task_id, exc):
+        message, log_path = record_task_error(task_id, exc)
+        task_manager.update_task(task_id, {
+            'logFile': os.path.basename(log_path), 'logPath': log_path,
+            'diagnosticSummary': message,
+        })
+        task_manager.complete_task(task_id, 'failed', message, error=message)
 
-    def _exception_payload(self, exc, context=None):
-        if context:
-            print(f"⚠️ [Zotero PDF2zh Server] {context} Error: {exc}")
-        else:
-            print(f"⚠️ [Zotero PDF2zh Server] Error: {exc}")
-        traceback.print_exception(type(exc), exc, exc.__traceback__)
+    def _handle_exception(self, exc, status_code=500, context=None, task_id=None):
+        return jsonify(self._exception_payload(exc, context=context, task_id=task_id)), status_code
+
+    def _exception_payload(self, exc, context=None, task_id=None):
         info = self._derive_error_info(exc)
+        print(f"⚠️ [Zotero PDF2zh Server] {context or ''} Error: {info['message']}")
         payload = {
             'status': 'error',
             'ok': False,
@@ -665,22 +668,31 @@ class PDFTranslator:
             payload['errorType'] = error_type
         if isinstance(exc, subprocess.CalledProcessError):
             payload['exitCode'] = exc.returncode
+        task = task_manager.get_task(task_id) or {}
+        log_path = getattr(exc, 'log_path', '') or task.get('logPath', '')
+        if log_path:
+            payload['logFile'] = os.path.basename(log_path)
+            payload['logPath'] = log_path
+        if task_id:
+            payload['taskId'] = task_id
         return payload
 
     def _derive_error_info(self, exc):
+        if getattr(exc, 'summary', ''):
+            return {'errorType': type(exc).__name__, 'message': safe_message(exc.summary)}
         parts = []
         if isinstance(exc, subprocess.CalledProcessError) and getattr(exc, 'stderr', None):
             parts.append(exc.stderr)
         formatted = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         if formatted:
             parts.append(formatted)
-        blob = '\n'.join(part for part in parts if part)
+        blob = safe_message('\n'.join(part for part in parts if part))
 
         ve_msg = self._extract_value_error(blob)
         if ve_msg:
             return {
                 'errorType': 'ValueError',
-                'message': ve_msg,
+                'message': safe_message(ve_msg),
             }
 
         def _tail_readable(text):
@@ -693,10 +705,10 @@ class PDFTranslator:
                 return ln
             return str(exc).strip() or exc.__class__.__name__
 
-        fallback_message = _tail_readable(blob) if blob else (str(exc).strip() or exc.__class__.__name__)
+        fallback_message = error_summary(blob.splitlines()) or (_tail_readable(blob) if blob else (str(exc).strip() or exc.__class__.__name__))
         return {
             'errorType': exc.__class__.__name__,
-            'message': fallback_message,
+            'message': safe_message(fallback_message)[:2000],
         }
 
     @staticmethod
@@ -793,8 +805,8 @@ class PDFTranslator:
                 '/crop-compare',
             )
         except Exception as e:
-            task_manager.complete_task(task_id, 'failed', str(e), error=str(e))
-            return self._handle_exception(e, context='/crop-compare')
+            self._record_task_failure(task_id, e)
+            return self._handle_exception(e, context='/crop-compare', task_id=task_id)
 
     def _execute_crop_compare_job(self, task_id, input_path, config, engine, infile_type):
         if infile_type == 'origin':
@@ -870,8 +882,8 @@ class PDFTranslator:
                 '/compare',
             )
         except Exception as e:
-            task_manager.complete_task(task_id, 'failed', str(e), error=str(e))
-            return self._handle_exception(e, context='/compare')
+            self._record_task_failure(task_id, e)
+            return self._handle_exception(e, context='/compare', task_id=task_id)
 
     def _execute_compare_job(self, task_id, input_path, config, engine, infile_type):
         if infile_type == 'origin':
@@ -1042,11 +1054,13 @@ class PDFTranslator:
         try:
             # 使用 execute_with_progress 替代原来的 execute_in_env / subprocess.run
             # 实时解析子进程输出中的进度信息并更新 task_manager
-            execute_with_progress(cmd, task_id, args, self.env_manager if args.enable_venv else None)
+            execution = execute_with_progress(cmd, task_id, args, self.env_manager if args.enable_venv else None)
         except subprocess.CalledProcessError as e:
-            print(f"⚠️ 翻译失败, 错误信息: {e}, 尝试跳过字体子集化, 重新渲染\n")
+            if config.skip_font_subsets or not re.search(r'font|subset|字体', str(e), re.I):
+                raise
+            print("⚠️ 字体子集化失败，尝试跳过字体子集化后重新渲染。")
             cmd.append('--skip-subset-fonts')
-            execute_with_progress(cmd, task_id, args, self.env_manager if args.enable_venv else None)
+            execution = execute_with_progress(cmd, task_id, args, self.env_manager if args.enable_venv else None)
         fileName = os.path.basename(input_path).replace('.pdf', '')
         if config.babeldoc:
             output_path_mono = os.path.join(output_folder, f"{fileName}.{config.targetLang}.mono.pdf")
@@ -1055,6 +1069,8 @@ class PDFTranslator:
             output_path_mono = os.path.join(output_folder, f"{fileName}-mono.pdf")
             output_path_dual = os.path.join(output_folder, f"{fileName}-dual.pdf")
         output_files = [output_path_mono, output_path_dual]
+        if not any(os.path.exists(path) for path in output_files):
+            raise missing_output_error(task_id, execution)
         for f in output_files: # 显示生成
             if not os.path.exists(f):
                 print(f"⚠️ 未找到期望生成的文件: {f}")
@@ -1134,88 +1150,15 @@ class PDFTranslator:
                 output_path.append(watermark_dual)
 
         if args.enable_winexe and os.path.exists(args.winexe_path):
-            cmd = [f"{args.winexe_path}"] + cmd[1:]  # Windows可执行文件
-            # 将所有是路径的字段, 改为os.path.normpath
-            cmd = [os.path.normpath(arg) if os.path.isfile(arg) or os.path.isdir(arg) else arg for arg in cmd]
-            # 设置工作目录为 exe 所在目录，确保相对路径解析正确
-            exe_dir = os.path.dirname(args.winexe_path)
-
-            # 打印开关状态
-            print(f"🔧 [winexe] winexe_attach_console={args.winexe_attach_console}")
-
-            if args.winexe_attach_console:
-
-                # 附着父控制台模式
-                print("🚀 [winexe] mode=attach-console")
-                print(f"📁 [winexe] cwd={exe_dir}")
-
-                # 隐藏敏感信息后的命令显示
-                safe_cmd = []
-                for i, arg in enumerate(cmd):
-                    if i > 0 and any(sensitive in cmd[i-1].lower() for sensitive in ['key', 'token', 'secret', 'password']):
-                        safe_cmd.append('***')
-                    else:
-                        safe_cmd.append(arg)
-                print(f"⚡ [winexe] cmd={' '.join(safe_cmd)}")
-
-                # Do not launch a separate ``--help`` process just to probe
-                # console visibility.  Some standalone pdf2zh executables do
-                # substantial initialization even for help output.  The real
-                # translation process below is the only process needed here;
-                # DeepSeek capability validation remains handled separately.
-                # 执行主命令 - 附着父控制台
-                print("🔍 [winexe] 开始执行（预期在当前终端显示实时日志）...")
-                process = subprocess.Popen(
-                    cmd,
-                    shell=False,
-                    cwd=exe_dir,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1,
-                )
-
-                stderr_lines = []
-                if process.stderr:
-                    for line in process.stderr:
-                        stderr_lines.append(line)
-                        sys.stderr.write(line)
-                        sys.stderr.flush()
-                    process.stderr.close()
-
-                return_code = process.wait()
-                if return_code != 0:
-                    stderr_text = ''.join(stderr_lines)
-                    value_error = self._extract_value_error(stderr_text)
-                    if value_error:
-                        raise ValueError(value_error)
-                    print(f"❌ pdf2zh.exe 执行失败，退出码: {return_code}")
-                    print("   操作失败，请查看详细日志。")
-                    raise RuntimeError(f"pdf2zh.exe 执行失败，退出码: {return_code}")
-
-            else:
-                # 回退模式：静默模式（旧行为）
-                print("🔇 [winexe] mode=silent")
-                r = subprocess.run(
-                    cmd,
-                    shell=False,
-                    cwd=exe_dir,
-                    creationflags=CREATE_NO_WINDOW,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8"
-                )
-                if r.returncode != 0:
-                    value_error = self._extract_value_error(r.stderr or '')
-                    if value_error:
-                        raise ValueError(value_error)
-                    raise RuntimeError(f"pdf2zh.exe 退出码 {r.returncode}\nstdout:\n{r.stdout}\nstderr:\n{r.stderr}")
+            executable = os.path.abspath(args.winexe_path)
+            cmd = [executable] + cmd[1:]
+            execution = execute_with_progress(
+                cmd, task_id, args, None, cwd=os.path.dirname(executable)
+            )
         elif args.enable_venv:
-            # 使用 execute_with_progress 替代原来的 execute_in_env
-            # 实时解析子进程输出中的进度信息并更新 task_manager
-            execute_with_progress(cmd, task_id, args, self.env_manager)
+            execution = execute_with_progress(cmd, task_id, args, self.env_manager)
         else:
-            execute_with_progress(cmd, task_id, args, None)
+            execution = execute_with_progress(cmd, task_id, args, None)
         existing = [p for p in output_path if os.path.exists(p)]
 
         for f in existing:
@@ -1223,7 +1166,7 @@ class PDFTranslator:
             print(f"🐲 pdf2zh_next 翻译成功, 生成文件: {f}, 大小为: {size/1024.0/1024.0:.2f} MB")
 
         if not existing:
-            raise RuntimeError("操作失败，请查看详细日志。")
+            raise missing_output_error(task_id, execution)
 
         return existing
 
@@ -1267,7 +1210,7 @@ if __name__ == '__main__':
     parser.add_argument('--enable_venv', type=str2bool, default=enable_venv, help='脚本自动开启虚拟环境')
     parser.add_argument('--env_tool', choices=['auto', 'uv', 'conda'], default=default_env_tool, help='环境管理工具；auto 会沿用已有 uv/conda，新环境优先 uv')
     parser.add_argument('--check_update', type=str2bool, default=True, help='启动时检查更新')
-    parser.add_argument('--update_source', type=str, default='gitee', help='优先更新源 gitee 或 github；失败时自动尝试另一个源')
+    parser.add_argument('--update_source', type=str, default='github', help='社区版使用 GitHub 更新源')
     parser.add_argument('--debug', type=str2bool, default=False, help='Enable debug mode')
     parser.add_argument('--enable_winexe', type=str2bool, default=False, help='使用pdf2zh_next Windows可执行文件运行脚本, 仅限Windows系统')
     parser.add_argument('--enable_mirror', type=str2bool, default=True, help='启用下载镜像加速, 仅限中国大陆用户')

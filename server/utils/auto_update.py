@@ -11,9 +11,9 @@ import urllib.request
 import zipfile
 
 
-OWNER = "guaguastandup"
-REPO = "zotero-pdf2zh"
-USER_AGENT = "zotero-pdf2zh-server-updater"
+OWNER = "Q1351998764"
+REPO = "zotero-pdf2zh-community"
+USER_AGENT = "zotero-pdf2zh-community-updater"
 NOTICE_RELATIVE_PATH = "server/notice.json"
 NOTICE_TIMEOUT = 8
 
@@ -31,9 +31,9 @@ def _server_version_from_file(path):
 
 
 def _source_order(preferred):
-    preferred = "gitee" if str(preferred).strip().lower() == "gitee" else "github"
-    other = "github" if preferred == "gitee" else "gitee"
-    return [preferred, other]
+    # This fork has no authenticated Gitee mirror. Never fall back to a
+    # same-named repository on another host or to the upstream maintainer.
+    return ["github"]
 
 
 def _looks_like_zip(path):
@@ -75,7 +75,7 @@ def _download_first(urls, destination, label):
             print(f"  - 尝试下载 {label}: {url}")
             payload, content_type = _http_get(url)
             if _payload_is_html(payload, content_type):
-                raise RuntimeError("下载内容是 HTML（可能是 Gitee 安全验证页）")
+                raise RuntimeError("下载内容是 HTML（可能是网络验证或错误页）")
             with open(destination, "wb") as handle:
                 handle.write(payload)
             if not _looks_like_zip(destination):
@@ -99,13 +99,9 @@ def get_xpi_info_from_repo(owner, repo, branch="main", expected_version=None, up
     if not expected_version:
         return [], None
     tag = f"v{expected_version}"
-    target_filename = "zotero-pdf-2-zh.xpi"
+    target_filename = "zotero-pdf2zh-community.xpi"
     github_url = f"https://github.com/{owner}/{repo}/releases/download/{tag}/{target_filename}"
-    gitee_url = f"https://gitee.com/{owner}/{repo}/releases/download/{tag}/{target_filename}"
-    urls = [
-        gitee_url if source == "gitee" else github_url
-        for source in _source_order(update_source)
-    ]
+    urls = [github_url]
     return urls, target_filename
 
 
@@ -173,27 +169,7 @@ def _server_download_urls(owner, repo, expected_version, update_source):
         if tag
         else f"https://github.com/{owner}/{repo}/releases/latest/download/server.zip"
     )
-    urls = []
-    for source in _source_order(update_source):
-        if source == "github":
-            urls.append(github_release)
-            if tag:
-                urls.append(
-                    f"https://raw.githubusercontent.com/{owner}/{repo}/{tag}/server.zip"
-                )
-            continue
-        if tag:
-            urls.append(
-                f"https://gitee.com/{owner}/{repo}/releases/download/{tag}/server.zip"
-            )
-            urls.append(f"https://gitee.com/{owner}/{repo}/raw/{tag}/server.zip")
-    seen = set()
-    ordered = []
-    for url in urls:
-        if url not in seen:
-            seen.add(url)
-            ordered.append(url)
-    return ordered
+    return [github_release]
 
 
 def perform_update_optimized(root_path, local_version, expected_version=None, update_source="github"):
@@ -202,6 +178,7 @@ def perform_update_optimized(root_path, local_version, expected_version=None, up
     project_root = os.path.dirname(root_path)
     exclude_directories = [
         "translated",
+        "logs",
         "zotero-pdf2zh-next-venv",
         "zotero-pdf2zh-venv",
         "zotero-pdf2zh-next-venv.staging",
@@ -301,80 +278,26 @@ def _version_from_json_release(payload):
     return str(payload.get("tag_name", "") or "").lstrip("v")
 
 
-def _version_from_server_py(text):
-    match = re.search(r'__version__\s*=\s*["\'](.+?)["\']', text)
-    return match.group(1) if match else ""
-
-
 def _latest_version_from_github():
-    versions = []
-    try:
-        payload_bytes, content_type = _http_get(
-            f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest",
-            timeout=30,
-        )
-        if _payload_is_html(payload_bytes, content_type):
-            raise RuntimeError("GitHub API 返回了 HTML")
-        version = _version_from_json_release(json.loads(payload_bytes.decode("utf-8")))
-        if version:
-            versions.append(version)
-    except Exception as exc:
-        print(f"  - ⚠️ GitHub Release API 不可用: {exc}")
-    try:
-        payload_bytes, content_type = _http_get(
-            f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/server/server.py",
-            timeout=30,
-        )
-        if _payload_is_html(payload_bytes, content_type):
-            raise RuntimeError("GitHub raw 返回了 HTML")
-        version = _version_from_server_py(payload_bytes.decode("utf-8"))
-        if version:
-            versions.append(version)
-    except Exception as exc:
-        print(f"  - ⚠️ GitHub raw 版本检查不可用: {exc}")
-    if not versions:
-        raise RuntimeError("GitHub 无法确定远程版本")
-    return max(versions, key=_version_tuple)
+    # main can contain an unreleased version. Offer only a release that has
+    # a downloadable server archive, never source-only development commits.
+    payload_bytes, content_type = _http_get(
+        f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest",
+        timeout=15,
+    )
+    if _payload_is_html(payload_bytes, content_type):
+        raise RuntimeError("GitHub API 返回了 HTML")
+    release = json.loads(payload_bytes.decode("utf-8"))
+    version = _version_from_json_release(release)
+    if release.get("draft") or release.get("prerelease") or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise RuntimeError("没有可安装的社区版正式发布")
+    if not any(asset.get("name") == "server.zip" for asset in release.get("assets", [])):
+        raise RuntimeError("最新发布没有 server.zip，暂不提供自动更新")
+    return version
 
 
-def _latest_version_from_gitee():
-    versions = []
-    try:
-        payload_bytes, content_type = _http_get(
-            f"https://gitee.com/api/v5/repos/{OWNER}/{REPO}/releases/latest",
-            timeout=30,
-        )
-        if _payload_is_html(payload_bytes, content_type):
-            raise RuntimeError("Gitee API 返回了 HTML 安全验证页")
-        version = _version_from_json_release(json.loads(payload_bytes.decode("utf-8")))
-        if version:
-            versions.append(version)
-    except Exception as exc:
-        print(f"  - ⚠️ Gitee Release API 不可用: {exc}")
-    try:
-        payload_bytes, content_type = _http_get(
-            f"https://gitee.com/{OWNER}/{REPO}/raw/main/server/server.py",
-            timeout=30,
-        )
-        if _payload_is_html(payload_bytes, content_type):
-            raise RuntimeError("Gitee raw 返回了 HTML 安全验证页")
-        version = _version_from_server_py(payload_bytes.decode("utf-8"))
-        if version:
-            versions.append(version)
-    except Exception as exc:
-        print(f"  - ⚠️ Gitee raw 版本检查不可用: {exc}")
-    if not versions:
-        raise RuntimeError("Gitee 无法确定远程版本")
-    return max(versions, key=_version_tuple)
-
-
-def _notice_urls(update_source="gitee"):
-    gitee_url = f"https://gitee.com/{OWNER}/{REPO}/raw/main/{NOTICE_RELATIVE_PATH}"
-    github_url = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/{NOTICE_RELATIVE_PATH}"
-    return [
-        gitee_url if source == "gitee" else github_url
-        for source in _source_order(update_source)
-    ]
+def _notice_urls(update_source="github"):
+    return [f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/{NOTICE_RELATIVE_PATH}"]
 
 
 def _notice_applies(notice, local_version):
@@ -442,9 +365,6 @@ def _print_community(community):
     print("👥 交流")
     if open_groups:
         print("   QQ群: " + "  |  ".join(open_groups))
-    else:
-        print("   QQ群请看 GitHub 主页最新群号")
-    print("   入群口令请到 GitHub / Gitee 仓库主页查看")
     ask = str(community.get("ask") or "").strip()
     if ask:
         print(f"   {ask}")
@@ -465,7 +385,7 @@ def _local_notice_path():
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "notice.json")
 
 
-def _load_notice_payload(update_source="gitee"):
+def _load_notice_payload(update_source="github"):
     for url in _notice_urls(update_source):
         try:
             payload_bytes, content_type = _http_get(url, timeout=NOTICE_TIMEOUT)
@@ -487,7 +407,7 @@ def _load_notice_payload(update_source="gitee"):
     return None, None
 
 
-def fetch_and_show_notices(local_version, update_source="gitee"):
+def fetch_and_show_notices(local_version, update_source="github"):
     """Fetch live notices from the repo. Network failures never block startup."""
     try:
         payload, _source = _load_notice_payload(update_source)
@@ -504,14 +424,11 @@ def fetch_and_show_notices(local_version, update_source="gitee"):
 
 def check_for_updates(local_version, update_source="github"):
     print("🔍 [自动更新] 正在检查 Server 更新...")
-    print("   将同时尝试 GitHub 与 Gitee，优先使用配置的更新源。")
+    print(f"   社区维护版更新源: https://github.com/{OWNER}/{REPO}/releases")
     found = []
     for source in _source_order(update_source):
         try:
-            if source == "github":
-                version = _latest_version_from_github()
-            else:
-                version = _latest_version_from_gitee()
+            version = _latest_version_from_github()
             print(f"  - {source}: {version}")
             found.append((source, version))
         except Exception as exc:

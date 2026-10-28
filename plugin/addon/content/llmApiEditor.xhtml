@@ -528,7 +528,7 @@ href="chrome://zotero/skin/zotero.css" type="text/css"?>
             let mergedServices = {};
             let currentData = {};
             let isEditMode = false;
-            const HISTORY_PREF_KEY = "extensions.pdf2zh.llm.history";
+            const HISTORY_PREF_KEY = "__prefsPrefix__.llm.history";
             const DEEPSEEK_THINKING_FIELDS = {
                 deepseek_thinking_mode: {
                     values: ["disabled", "enabled"],
@@ -995,7 +995,7 @@ href="chrome://zotero/skin/zotero.css" type="text/css"?>
             function safeGetStorage() {
                 try {
                     if (Zotero && Zotero.Prefs) {
-                        const val = Zotero.Prefs.get(HISTORY_PREF_KEY);
+                        const val = Zotero.Prefs.get(HISTORY_PREF_KEY, true);
                         if (val) return JSON.parse(val);
                     }
                 } catch (e) {}
@@ -1008,6 +1008,7 @@ href="chrome://zotero/skin/zotero.css" type="text/css"?>
                         Zotero.Prefs.set(
                             HISTORY_PREF_KEY,
                             JSON.stringify(data),
+                            true,
                         );
                     }
                 } catch (e) {}

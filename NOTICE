@@ -1,0 +1,18 @@
+Zotero PDF2zh Community
+
+This is an unofficial community-maintained fork of
+https://github.com/guaguastandup/zotero-pdf2zh
+Copyright and original authorship remain with the respective upstream authors.
+Community maintenance: Q1351998764, beginning 2026-10-28.
+
+Community changes include independent update channels and plugin identity,
+OpenAI-compatible response validation, managed dependency compatibility,
+verified legacy asset recovery, local diagnostic logs, and release validation.
+
+This distribution is provided under the accompanying GNU Affero General
+Public License, version 3 or later, without warranty. Corresponding source:
+https://github.com/Q1351998764/zotero-pdf2zh-community
+
+PDFMathTranslate, PDFMathTranslate-next, BabelDOC, and other dependencies retain
+their own licenses. They are installed separately by the managed Python runtime.
+This fork is not endorsed by or an official release of the upstream authors.

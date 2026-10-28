@@ -1,0 +1,5 @@
+-r requirements.txt
+httpx
+openai==2.3.0
+pydantic
+bitstring==4.3.1

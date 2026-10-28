@@ -147,20 +147,30 @@ def _remove_option(cmd: list[str], flag: str) -> list[str]:
 
 def _invocation_prefix(final_cmd: list[str]) -> list[str]:
     """Return the exact executable prefix used for this pdf2zh_next process."""
-    for index, value in enumerate(final_cmd):
+    for index, value in enumerate(final_cmd[1:], start=1):
+        # Managed runners use -u; preserve other no-argument Python isolation
+        # flags when identifying the runtime without launching its CLI.
+        if value in {"-u", "-I", "-E", "-s", "-S", "-B"}:
+            continue
         if value == "-m" and index + 1 < len(final_cmd) and final_cmd[index + 1] == "pdf2zh_next":
             return final_cmd[: index + 2]
+        if (
+            Path(value).name == "engine_runner.py"
+            and index + 1 < len(final_cmd)
+            and final_cmd[index + 1] == "pdf2zh_next"
+        ):
+            return final_cmd[: index + 2]
+        # Only the Python invocation prefix is relevant. A PDF filename or an
+        # unrelated option later in a normal executable command is not a runner.
+        break
     return final_cmd[:1]
 
 
 def _python_for_invocation_prefix(invocation_prefix: list[str]) -> Path | None:
-    """Resolve the Python interpreter behind a normal pdf2zh_next launcher."""
-    if (
-        len(invocation_prefix) >= 3
-        and invocation_prefix[1] == "-m"
-        and invocation_prefix[2] == "pdf2zh_next"
-    ):
-        candidate = Path(invocation_prefix[0])
+    """Resolve Python behind a console launcher, module call, or our runner."""
+    if len(invocation_prefix) > 1 and _invocation_prefix(invocation_prefix) == invocation_prefix:
+        raw_python = invocation_prefix[0]
+        candidate = Path(shutil.which(raw_python) or raw_python)
         return candidate if candidate.exists() else None
 
     raw = invocation_prefix[0] if invocation_prefix else ""

@@ -4,6 +4,7 @@
             "python_version": "3.12",
             "packages": [
                 "pdf2zh==1.9.11",
+                "bitstring==4.3.1",
                 "pypdf",
                 "PyMuPDF",
                 "flask",
@@ -17,6 +18,7 @@
             "python_version": "3.12",
             "packages": [
                 "pdf2zh==1.9.11",
+                "bitstring==4.3.1",
                 "pypdf",
                 "PyMuPDF",
                 "flask",
@@ -31,9 +33,12 @@
         "conda": {
             "python_version": "3.12",
             "packages": [
-                "pdf2zh_next>=2.9.0,<3.0.0",
+                "pdf2zh-next==2.9.0",
+                "BabelDOC==0.6.2",
+                "bitstring==4.3.1",
+                "openai==2.3.0",
                 "pypdf",
-                "PyMuPDF",
+                "PyMuPDF==1.25.2",
                 "flask",
                 "toml",
                 "packaging"
@@ -42,9 +47,12 @@
         "uv": {
             "python_version": "3.12",
             "packages": [
-                "pdf2zh_next>=2.9.0,<3.0.0",
+                "pdf2zh-next==2.9.0",
+                "BabelDOC==0.6.2",
+                "bitstring==4.3.1",
+                "openai==2.3.0",
                 "pypdf",
-                "PyMuPDF",
+                "PyMuPDF==1.25.2",
                 "flask",
                 "toml",
                 "packaging"

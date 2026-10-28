@@ -49,9 +49,21 @@ PRIMARY_PACKAGES = {
     "pdf2zh_next": "pdf2zh-next",
 }
 VERSION_PACKAGES = {
-    "pdf2zh": ["pdf2zh", "BabelDOC", "PyMuPDF", "pypdf"],
-    "pdf2zh_next": ["pdf2zh-next", "BabelDOC", "PyMuPDF", "pypdf"],
+    "pdf2zh": ["pdf2zh", "BabelDOC", "PyMuPDF", "pypdf", "bitstring"],
+    "pdf2zh_next": ["pdf2zh-next", "BabelDOC", "PyMuPDF", "pypdf", "bitstring", "openai"],
 }
+# Verified against the published PyPI metadata. BabelDOC 0.6.3+ requires
+# PyMuPDF >=1.26.7, which conflicts with pdf2zh-next 2.9.0's <1.25.3.
+# bitstring 5 removed BitStream, still imported by this BabelDOC generation.
+# Keep the OpenAI SDK at the version exercised by the response-adapter tests.
+MANAGED_NEXT_REQUIREMENTS = (
+    "pdf2zh-next==2.9.0",
+    "BabelDOC==0.6.2",
+    "PyMuPDF==1.25.2",
+    "bitstring==4.3.1",
+    "openai==2.3.0",
+)
+BITSTREAM_REQUIREMENT = "bitstring==4.3.1"
 THINKING_FLAGS = (
     "--deepseek-thinking-mode",
     "--deepseek-reasoning-effort",
@@ -184,10 +196,31 @@ def load_requirements(
 ) -> tuple[str, list[str]]:
     config = load_environment_config(config_path)
     engine_config = config.get(engine, {}).get(env_tool, {})
-    return (
-        str(engine_config.get("python_version", "3.12")),
-        list(engine_config.get("packages", [])),
-    )
+    packages = list(engine_config.get("packages", []))
+    if engine in {"pdf2zh_next", "pdf2zh"}:
+        # Existing installations retain their venv.json. Apply the maintained
+        # compatibility set at the common install/update boundary as well as in
+        # the shipped example, so stale broad constraints cannot pull bitstring 5.
+        from packaging.requirements import Requirement
+        from packaging.utils import canonicalize_name
+
+        # pdf2zh 1.9.11 imports BabelDOC <0.3 at CLI startup; that generation
+        # also imports BitStream but permits bitstring 5 in its metadata.
+        # Preserve every other legacy requirement rather than applying 2.x pins.
+        pinned_requirements = (
+            MANAGED_NEXT_REQUIREMENTS if engine == "pdf2zh_next"
+            else (BITSTREAM_REQUIREMENT,)
+        )
+        pinned_names = {
+            canonicalize_name(Requirement(raw).name)
+            for raw in pinned_requirements
+        }
+        packages = [
+            raw for raw in packages
+            if canonicalize_name(Requirement(raw).name) not in pinned_names
+        ]
+        packages = [*pinned_requirements, *packages]
+    return str(engine_config.get("python_version", "3.12")), packages
 
 
 def _conda_info() -> dict | None:
@@ -297,12 +330,14 @@ def read_versions(python_path: Path, engine: str) -> dict[str, str | None]:
         "\nfor name in names:\n"
         "    try: out[name]=version(name)\n"
         "    except PackageNotFoundError: out[name]=None\n"
-        "print(json.dumps(out))"
+        "print(json.dumps(out, ensure_ascii=True))"
     )
     result = subprocess.run(
-        [str(python_path), "-I", "-c", code],
+        [str(python_path), "-I", "-X", "utf8", "-c", code],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=managed_python_env(),
         timeout=60,
     )
@@ -359,7 +394,7 @@ def runtime_supports_deepseek_thinking(
         "    out={'supported': bool(field_ok and cli_ok), 'reason': 'ok' if field_ok and cli_ok else 'missing-fields-or-cli-mapping'}\n"
         "except Exception as exc:\n"
         "    out={'supported': False, 'reason': type(exc).__name__ + ': ' + str(exc)}\n"
-        "print(json.dumps(out))"
+        "print(json.dumps(out, ensure_ascii=True))"
     )
     try:
         runtime_env = (
@@ -370,12 +405,14 @@ def runtime_supports_deepseek_thinking(
         command = [str(python_path)]
         if isolated:
             command.append("-I")
-        command.extend(["-c", code])
+        command.extend(["-X", "utf8", "-c", code])
         result = subprocess.run(
             command,
             cwd=SERVER_ROOT,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=runtime_env,
             timeout=20,
         )
@@ -628,13 +665,18 @@ def managed_runtime_health(
     heavyweight pdf2zh_next CLI startup and import only its small critical
     native dependency chain.
     """
-    if engine != "pdf2zh_next":
+    if engine not in {"pdf2zh_next", "pdf2zh"}:
         return True, "ok"
+
+    names = (
+        ("pydantic", "pydantic_core", "pydantic_core._pydantic_core", "bitstring")
+        if engine == "pdf2zh_next" else ("bitstring",)
+    )
 
     code = (
         "import importlib, json, os, sys; "
         "root=os.path.normcase(os.path.realpath(sys.prefix)); "
-        "names=('pydantic','pydantic_core','pydantic_core._pydantic_core'); "
+        f"names={names!r}; "
         "out={'ok': True, 'reason': 'ok', 'root': root}; "
         "\ntry:\n"
         "    for name in names:\n"
@@ -649,16 +691,22 @@ def managed_runtime_health(
         "            inside=False\n"
         "        if not inside:\n"
         "            raise RuntimeError(name + ' 来自托管环境之外: ' + origin)\n"
+        "        if name == 'bitstring' and not hasattr(module, 'BitStream'):\n"
+        "            raise RuntimeError('bitstring 不提供 BitStream；需要 bitstring==4.3.1')\n"
         "except Exception as exc:\n"
         "    out={'ok': False, 'reason': type(exc).__name__ + ': ' + str(exc), 'root': root}\n"
-        "print(json.dumps(out, ensure_ascii=False))"
+        "print(json.dumps(out, ensure_ascii=True))"
     )
     try:
+        # -I ignores PYTHONUTF8. Select the child and parent pipe encoding
+        # explicitly, including stderr from imports in Chinese Windows paths.
         result = subprocess.run(
-            [str(python_path), "-I", "-c", code],
+            [str(python_path), "-I", "-X", "utf8", "-c", code],
             cwd=SERVER_ROOT,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=managed_python_env(),
             timeout=30,
         )
@@ -669,6 +717,36 @@ def managed_runtime_health(
         return bool(payload.get("ok")), str(payload.get("reason") or "unknown error")
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
+
+
+def repair_bitstream_dependency(
+    env_tool: str,
+    python_path: Path,
+    *,
+    engine: str = "pdf2zh_next",
+    preferred_index: str | None = None,
+) -> bool:
+    """Repair the removed BitStream API without upgrading a working old engine.
+
+    This narrow repair is used only after the managed health probe identified
+    bitstring as broken. Explicit full updates still install the pinned set.
+    """
+    if engine not in {"pdf2zh_next", "pdf2zh"}:
+        raise ValueError(f"Unknown engine: {engine}")
+    requirements = [BITSTREAM_REQUIREMENT]
+    print("🔧 检测到 BitStream 兼容性问题，将在当前翻译环境修复 bitstring。")
+    sources = choose_install_sources(
+        engine, env_tool, python_path, requirements,
+        preferred_index=preferred_index,
+    )
+    if not sources or not _run_install(
+        env_tool, python_path, requirements, sources, reinstall=True,
+    ):
+        return False
+    healthy, reason = managed_runtime_health(engine, python_path)
+    if not healthy:
+        print(f"⚠️ BitStream 修复后环境仍未通过检查: {reason}")
+    return healthy
 
 
 def validate_environment(
@@ -689,10 +767,12 @@ def validate_environment(
             "    assert not req.specifier or req.specifier.contains(installed), (raw, installed)\n"
         )
         result = subprocess.run(
-            [str(python_path), "-I", "-c", code],
+            [str(python_path), "-I", "-X", "utf8", "-c", code],
             cwd=SERVER_ROOT,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=managed_python_env(),
             timeout=90,
         )

@@ -3,6 +3,7 @@
 # zotero-pdf2zh
 import json, toml
 import os
+from urllib.parse import urlsplit, urlunsplit
 
 from utils.config_map import (
     pdf2zh_config_map,
@@ -59,6 +60,22 @@ _FALSE_VALUES = {'false', '0', 'no', 'off'}
 
 def resolve_pdf2zh_next_service(service):
     return pdf2zh_next_service_aliases.get(service, service)
+
+
+def normalize_chat_base_url(service, value):
+    """Normalize a full pasted chat endpoint for OpenAI-compatible base URLs."""
+    value = str(value or '').strip()
+    if service not in {'openai', 'openailiked', 'openaicompatible'}:
+        return value
+    try:
+        parts = urlsplit(value)
+        path = parts.path.rstrip('/')
+        if parts.scheme in {'http', 'https'} and path.endswith('/chat/completions'):
+            path = path[:-len('/chat/completions')]
+            return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
+    except ValueError:
+        pass
+    return value
 
 
 def _is_pdf2zh_next_bool_extra_key(key):
@@ -135,13 +152,13 @@ class Config:
             self.skip_last_pages = 0
 
         self.thread_num = request_data.get('threadNum', 8)
-        try: 
+        try:
             self.thread_num = int(self.thread_num)
             if self.thread_num < 1:
                 self.thread_num = 8
         except (ValueError, TypeError):
             self.thread_num = 8
-        
+
         self.qps = request_data.get('qps', 4)
         try:
             self.qps = int(self.qps)
@@ -149,7 +166,7 @@ class Config:
             self.qps = 4
         if self.qps < 1:
             self.qps = 4
-        
+
         self.pool_size = request_data.get('poolSize', 0)
         try:
             self.pool_size = int(self.pool_size)
@@ -197,11 +214,9 @@ class Config:
         self.translate_table_text = stringToBoolean(request_data.get('translateTableText', False))
         self.only_include_translated_page = stringToBoolean(request_data.get('onlyIncludeTranslatedPage', False))
 
-        print("\n🔍 Config without llm_api: ", self.__dict__)
-
         self.llm_api = {
             'apiKey': request_data.get('llm_api', {}).get('apiKey', ''),
-            'apiUrl': request_data.get('llm_api', {}).get('apiUrl', ''),
+            'apiUrl': normalize_chat_base_url(self.service, request_data.get('llm_api', {}).get('apiUrl', '')),
             'model': request_data.get('llm_api', {}).get('model', ''),
             'threadnum': request_data.get('llm_api', {}).get('threadNum', self.thread_num), # TODO, 为每个服务单独配置线程数, 暂时不实现
             'extraData': request_data.get('llm_api', {}).get('extraData', {})
@@ -233,13 +248,13 @@ class Config:
                 if t.get('name') == service:
                     translator = t
                     break
-            
+
             if translator is None:
                 print(f"✏️ 服务 '{service}' 在先前配置中不存在, 创建新配置")
                 translator = {'name': service, 'envs': {}}
                 new_config['translators'].append(translator)
             else:
-                if not isinstance(translator.get('envs'), dict): 
+                if not isinstance(translator.get('envs'), dict):
                     translator['envs'] = {}
 
             translator_keys = []
@@ -248,7 +263,7 @@ class Config:
                     translator_keys.append(key)
 
             # 先对三个基本的参数进行映射, 如果存在映射关系, 则更新
-            keys = ['apiKey', 'apiUrl', 'model'] 
+            keys = ['apiKey', 'apiUrl', 'model']
             for key in keys:
                 if key in self.llm_api and key in config_map:
                     value = self.llm_api[key]
@@ -257,9 +272,9 @@ class Config:
                         translator['envs'][mapped_key] = value
                         translator_keys.append(mapped_key)
                         if key == "apiKey":
-                            print(f"✏️ 更新 {key}: {mapped_key} = {'*' * 8 + value[-4:] if len(value) > 4 else '*' * len(value)}")
+                            print(f"✏️ 已更新配置字段: {mapped_key}")
                         else:
-                            print(f"✏️ 更新 {key}: {mapped_key} = {value}") 
+                            print(f"✏️ 已更新配置字段: {mapped_key}")
                     else:
                         print(f"✏️ 跳过 {key}: {mapped_key} = {value} (empty or null)")
 
@@ -269,7 +284,7 @@ class Config:
                     if value not in (None, "", [], {}):
                         translator['envs'][key] = value
                         translator_keys.append(key)
-                        print(f"✏️ 更新 extraData: {key} = {_safe_log_value(key, value)}")
+                        print(f"✏️ 已更新额外配置字段: {key}")
                     else:
                         print(f"✏️ 跳过 extraData: {key} = {value} (empty or null)")
 
@@ -282,7 +297,7 @@ class Config:
             with open(config_file, 'w', encoding='utf-8') as f:
                 json.dump(new_config, f, indent=4, ensure_ascii=False)
                 print(f"✏️ 更新 config file: {config_file}")
-            
+
         elif engine == pdf2zh_next: # toml文件, 格式参考server/config/config.toml.example
             service = resolve_pdf2zh_next_service(service)
             config_map = pdf2zh_next_config_map.get(service, {})
@@ -337,7 +352,7 @@ class Config:
             pdf_config = new_config.setdefault('pdf', {})
             pdf_config['only_include_translated_page'] = self.only_include_translated_page
 
-            translator = None 
+            translator = None
             if f'{service}_detail' in new_config:
                 translator = new_config[f'{service}_detail']
             else:
@@ -356,7 +371,7 @@ class Config:
                 _normalize_openai_send_temperature_key(
                     self.llm_api.get('extraData')
                 )
-            
+
             translator_keys = ['translate_engine_type', 'support_llm']
             if 'extraData' in config_map:
                 for key in config_map['extraData']:
@@ -371,13 +386,13 @@ class Config:
                         translator[mapped_key] = value
                         translator_keys.append(mapped_key)
                         if key == "apiKey":
-                            print(f"✏️ 更新 {key}: {mapped_key} = {'*' * 8 + value[-4:] if len(value) > 4 else '*' * len(value)}")
+                            print(f"✏️ 已更新配置字段: {mapped_key}")
                         else:
-                            print(f"✏️ 更新 {key}: {mapped_key} = {value}") 
+                            print(f"✏️ 已更新配置字段: {mapped_key}")
                     else:
                         translator_keys.append(mapped_key)
                         print(f"✏️ 跳过 {key}: {mapped_key} = {value} (empty or null)")
-            
+
             # 将用户设置的extraData也进行映射, 如果存在映射关系, 则更新
             if 'extraData' in self.llm_api and isinstance(self.llm_api['extraData'], dict):
                 for key, value in self.llm_api['extraData'].items():
@@ -385,14 +400,13 @@ class Config:
                     if coerced not in (None, "", [], {}):
                         translator[key] = coerced
                         translator_keys.append(key)
-                        print(f"✏️ 更新 extraData: {key} = {_safe_log_value(key, coerced)}")
+                        print(f"✏️ 已更新额外配置字段: {key}")
                     else:
                         print(f"✏️ 跳过 extraData: {key} = {value} (empty or null)")
 
             # 将translator中, 所有不在translator_keys中的key删除
-            print(translator.keys())
             for key in list(translator.keys()):
-                if key not in translator_keys: 
+                if key not in translator_keys:
                     del translator[key]
                     print(f"✏️ 删除旧 {key}")
 

@@ -3,6 +3,7 @@ import os
 import threading
 import time
 from datetime import datetime
+from utils.diagnostics import safe_message
 
 
 # DEBUG_PROGRESS_LOG_PATH = os.path.join(
@@ -55,6 +56,10 @@ class TaskManager:
             # _debug_progress_log("TASK_ADD", task=self._task_snapshot(task_id, self.active_tasks[task_id]))
 
     def update_task(self, task_id, updates):
+        updates = dict(updates)
+        for key in ("message", "error", "diagnosticSummary", "diagnosticTail"):
+            if key in updates:
+                updates[key] = safe_message(updates[key])
         with self.lock:
             if task_id in self.active_tasks:
                 self.active_tasks[task_id].update(updates)
@@ -64,14 +69,21 @@ class TaskManager:
                 #     task=self._task_snapshot(task_id, self.active_tasks[task_id]),
                 # )
 
+    def get_task(self, task_id):
+        with self.lock:
+            task = self.active_tasks.get(task_id)
+            return dict(task) if task else None
+
     def complete_task(self, task_id, status, message=None, file_list=None, error=None, file_paths=None, output_dir=None, result=None):
+        message = safe_message(message) if message else None
+        error = safe_message(error) if error else None
         with self.lock:
             if task_id not in self.active_tasks:
                 return
             task = self.active_tasks[task_id]
             # Client disconnect after a successful translate can raise while
             # returning HTTP; do not overwrite a completed success as failure.
-            if task.get("active") is False and task.get("status") == "完成":
+            if task.get("active") is False and task.get("finished"):
                 return
             task["active"] = False
             task["finished"] = True
@@ -102,7 +114,12 @@ class TaskManager:
                 "startTime": task.get("startTime"),
                 "endTime": task.get("endTime"),
                 "config": task.get("config"),
+                "message": task.get("message"),
+                "modelName": task.get("modelName"),
             }
+            for key in ("logFile", "logPath", "diagnosticSummary"):
+                if task.get(key):
+                    history_item[key] = task[key]
             if file_list:
                 history_item["fileList"] = list(file_list)
             if file_paths:
@@ -122,7 +139,9 @@ class TaskManager:
 
     def get_active_tasks_list(self):
         with self.lock:
-            tasks = list(self.active_tasks.values())
+            # Full diagnostic tails stay in the per-task log, not in every SSE.
+            tasks = [{key: value for key, value in task.items() if key != "diagnosticTail"}
+                     for task in self.active_tasks.values()]
             return tasks
 
     def get_history(self):

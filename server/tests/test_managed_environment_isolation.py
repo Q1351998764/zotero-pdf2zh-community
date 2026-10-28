@@ -164,7 +164,7 @@ class ManagedEnvironmentIsolationTest(unittest.TestCase):
     def test_system_mode_keeps_ambient_python_settings(self):
         captured = {}
 
-        def capture(_cmd, env, _task_id, _cols, _rows):
+        def capture(_cmd, env, _task_id, **_kwargs):
             captured.update(env)
 
         args = SimpleNamespace(enable_venv=False)
@@ -179,7 +179,7 @@ class ManagedEnvironmentIsolationTest(unittest.TestCase):
                 "prepare_deepseek_runtime_command",
                 side_effect=lambda cmd, env: cmd,
             ),
-            patch.object(execute, "_execute_with_pty", side_effect=capture),
+            patch.object(execute, "_execute_captured", side_effect=capture),
         ):
             execute.execute_with_progress(["python", "-V"], None, args, None)
 
@@ -199,7 +199,7 @@ class ManagedEnvironmentIsolationTest(unittest.TestCase):
                     "PATH": "managed-bin",
                 }
 
-        def capture(_cmd, env, _task_id, _cols, _rows):
+        def capture(_cmd, env, _task_id, **_kwargs):
             captured.update(env)
 
         args = SimpleNamespace(enable_venv=True)
@@ -209,7 +209,7 @@ class ManagedEnvironmentIsolationTest(unittest.TestCase):
                 "prepare_deepseek_runtime_command",
                 side_effect=lambda cmd, env: cmd,
             ),
-            patch.object(execute, "_execute_with_pty", side_effect=capture),
+            patch.object(execute, "_execute_captured", side_effect=capture),
         ):
             execute.execute_with_progress(
                 ["pdf2zh_next", "paper.pdf"], None, args, Manager()

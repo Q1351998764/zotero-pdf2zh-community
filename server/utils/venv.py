@@ -19,6 +19,7 @@ from utils.environment_lifecycle import load_requirements
 from utils.environment_lifecycle import managed_python_env
 from utils.environment_lifecycle import managed_runtime_health
 from utils.environment_lifecycle import maybe_prompt_existing_user_update
+from utils.environment_lifecycle import repair_bitstream_dependency
 from utils.environment_lifecycle import resolve_environment_python
 from utils.environment_lifecycle import transactional_install_or_update
 
@@ -87,6 +88,7 @@ class VirtualEnvManager:
         self.curr_env_path = None
         self.conda_env_path = defaultdict(lambda: None)
         self.ensured_env = defaultdict(lambda: None)
+        self.health_failures = {}
 
         # Respect the user's selected manager when checking the existing env.
         # Only explicit `auto` may discover either uv or conda.
@@ -174,6 +176,12 @@ class VirtualEnvManager:
         still cause a transactional repair attempt.
         """
         try:
+            healthy, reason = managed_runtime_health(engine, python_path)
+            self.health_failures[(engine, str(python_path))] = "" if healthy else reason
+            if not healthy:
+                print(f"⚠️ {engine} 环境关键依赖不可用: {reason}")
+                return False
+
             _, required_packages = load_requirements(engine, env_tool, self.config_path)
             if required_packages:
                 code = (
@@ -197,11 +205,6 @@ class VirtualEnvManager:
                         + (result.stderr or result.stdout or "unknown error").strip()
                     )
                     return False
-
-            healthy, reason = managed_runtime_health(engine, python_path)
-            if not healthy:
-                print(f"⚠️ {engine} 环境关键依赖不可用: {reason}")
-                return False
 
             # Package presence is sufficient for an existing environment health
             # check.  Never launch ``pdf2zh_next --help`` here: pdf2zh_next 2.9
@@ -283,7 +286,7 @@ class VirtualEnvManager:
             existing = self._existing(engine, envtool)
             if not existing:
                 continue
-            if self.skip_install or self._requirements_ok(engine, envtool, existing[2]):
+            if self._requirements_ok(engine, envtool, existing[2]):
                 self._remember_environment(engine, envtool, existing[1])
                 print(f"✅ 使用 {envtool} 环境: {existing[1]}")
                 return True
@@ -294,7 +297,17 @@ class VirtualEnvManager:
             return False
 
         if repair_candidates:
-            repair_tool, _ = repair_candidates[0]
+            repair_tool, repair_environment = repair_candidates[0]
+            reason = self.health_failures.get((engine, str(repair_environment[2])), "")
+            if engine in {"pdf2zh_next", "pdf2zh"} and "bitstring" in reason.lower():
+                if repair_bitstream_dependency(
+                    repair_tool, repair_environment[2],
+                    engine=engine,
+                    preferred_index=self._preferred_index(),
+                ) and self._requirements_ok(engine, repair_tool, repair_environment[2]):
+                    self._remember_environment(engine, repair_tool, repair_environment[1])
+                    print("✅ BitStream 兼容依赖已修复，保留原有翻译引擎版本。")
+                    return True
             print(f"🔧 检测到 {repair_tool} 环境不完整，将直接安装缺失依赖。")
             if self.install_packages(engine, repair_tool, force_reinstall=True):
                 return True
@@ -370,7 +383,12 @@ class VirtualEnvManager:
         _, env_dir, python_path = existing
         bin_dir = env_dir / ("Scripts" if self.is_windows else "bin")
 
-        if command[0].lower() in {"pdf2zh", "pdf2zh_next"}:
+        if command[0].lower() == "pdf2zh_next":
+            runner = Path(__file__).resolve().parent.parent / "engine_runner.py"
+            if not runner.is_file():
+                raise RuntimeError(f"翻译兼容启动器缺失: {runner}")
+            final_cmd = [str(python_path), "-u", str(runner), "pdf2zh_next", *command[1:]]
+        elif command[0].lower() == "pdf2zh":
             executable = bin_dir / (command[0] + (".exe" if self.is_windows else ""))
             if executable.exists():
                 final_cmd = [str(executable), *command[1:]]

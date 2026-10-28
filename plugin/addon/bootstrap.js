@@ -11,8 +11,33 @@ var chromeHandle;
 
 function install(data, reason) {}
 
+// Community fork, 2026-10-28: copy explicitly saved upstream preferences once.
+// Values (including API keys) stay in the local Zotero profile and are never logged.
+function migrateCommunityPreferences() {
+    const source = Services.prefs.getBranch("extensions.zotero.pdf2zh.");
+    const target = Services.prefs.getBranch("__prefsPrefix__.");
+    if (target.getBoolPref("communityMigrated", false)) return;
+    for (const key of source.getChildList("")) {
+        if (!source.prefHasUserValue(key) || target.prefHasUserValue(key))
+            continue;
+        switch (source.getPrefType(key)) {
+            case 32:
+                target.setStringPref(key, source.getStringPref(key));
+                break;
+            case 64:
+                target.setIntPref(key, source.getIntPref(key));
+                break;
+            case 128:
+                target.setBoolPref(key, source.getBoolPref(key));
+                break;
+        }
+    }
+    target.setBoolPref("communityMigrated", true);
+}
+
 async function startup({ id, version, resourceURI, rootURI }, reason) {
     await Zotero.initializationPromise;
+    migrateCommunityPreferences();
 
     // String 'rootURI' introduced in Zotero 7
     if (!rootURI) {

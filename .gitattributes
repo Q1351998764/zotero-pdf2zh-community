@@ -1,3 +1,10 @@
-# 只锁定这两个批处理脚本为 CRLF
-/server/install-with-conda.bat text eol=crlf
-/server/install-with-uv.bat    text eol=crlf
+* text=auto
+*.sh text eol=lf
+*.bat text eol=crlf
+*.py text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.xhtml text eol=lf
+*.js text eol=lf
+*.ts text eol=lf
+*.mts text eol=lf

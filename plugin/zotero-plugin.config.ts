@@ -7,11 +7,11 @@ export default defineConfig({
     name: pkg.config.addonName,
     id: pkg.config.addonID,
     namespace: pkg.config.addonRef,
-    updateURL: `https://github.com/{{owner}}/{{repo}}/releases/download/release/${
+    updateURL: `https://github.com/Q1351998764/zotero-pdf2zh-community/releases/download/release/${
         pkg.version.includes("-") ? "update-beta.json" : "update.json"
     }`,
     xpiDownloadLink:
-        "https://github.com/{{owner}}/{{repo}}/releases/download/v{{version}}/{{xpiName}}.xpi",
+        "https://github.com/Q1351998764/zotero-pdf2zh-community/releases/download/v{{version}}/zotero-pdf2zh-community.xpi",
 
     build: {
         assets: ["addon/**/*.*"],

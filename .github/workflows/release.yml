@@ -2,26 +2,46 @@ name: Release
 
 on:
   push:
-    tags:
-      - 'v**'
+    tags: ['v*']
 
 permissions:
-  contents: write
-  issues: write
-  pull-requests: write
+  contents: read
+
+# Stable and beta channels share one metadata release; never update it concurrently.
+concurrency:
+  group: release-publication
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
-  release:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Verify and publish versioned artifacts
+    needs: ci
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Verify tag matches plugin and Server versions
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify tag, plugin, and Server versions
+        id: version
         run: |
           python - <<'PY'
           import json
@@ -29,92 +49,135 @@ jobs:
           import re
           from pathlib import Path
 
-          tag = os.environ['GITHUB_REF_NAME']
-          expected = tag[1:] if tag.startswith('v') else tag
-          plugin_version = str(json.loads(Path('plugin/package.json').read_text(encoding='utf-8'))['version'])
-          server_text = Path('server/server.py').read_text(encoding='utf-8')
-          match = re.search(r'^__version__\s*=\s*["\x27]([^"\x27]+)["\x27]', server_text, re.MULTILINE)
-          if not match:
-              raise SystemExit('Could not find server __version__')
-          server_version = match.group(1)
-          print(f'tag={tag} plugin={plugin_version} server={server_version}')
-          if plugin_version != expected or server_version != expected:
-              raise SystemExit('Release tag does not match plugin/Server versions')
+          package = json.loads(Path('plugin/package.json').read_text('utf-8'))
+          version = package['version']
+          match = re.search(
+              r'^__version__\s*=\s*["\x27]([^"\x27]+)',
+              Path('server/server.py').read_text('utf-8'), re.MULTILINE,
+          )
+          if not match or match[1] != version or os.environ['RELEASE_TAG'] != f'v{version}':
+              raise SystemExit('Release tag, plugin, and Server versions must match exactly')
+          if not re.fullmatch(r'\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?', version):
+              raise SystemExit('Unsupported release version')
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'version={version}\nprerelease={str("-" in version).lower()}\n')
+          print(f'Validated release v{version}')
           PY
+      # Reuse the exact artifacts built by this run's successful CI.
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ github.sha }}
+          path: dist
+      - name: Verify the complete artifact set
+        run: |
+          python - <<'PY'
+          from pathlib import Path
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+          expected = {
+              'zotero-pdf2zh-community.xpi', 'server.zip', 'update.json', 'SHA256SUMS.txt',
+          }
+          actual = {item.name for item in Path('dist').iterdir() if item.is_file()}
+          if actual != expected:
+              raise SystemExit(f'Unexpected release artifacts: {actual}')
+          PY
+          cd dist
+          sha256sum --check SHA256SUMS.txt
+      - name: Create or resume a draft release
+        env:
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          if draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft'); then
+            if [ "$draft" != true ]; then
+              echo 'Refusing to overwrite an already published version.' >&2
+              exit 1
+            fi
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft \
+              --prerelease="$PRERELEASE" --latest=false \
+              --title "$RELEASE_TAG" --notes-file CHANGELOG.md
+          fi
+      - name: Upload all artifacts to the draft
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            dist/zotero-pdf2zh-community.xpi dist/server.zip \
+            dist/update.json dist/SHA256SUMS.txt --clobber
+      - name: Download and compare every draft asset before publication
+        run: |
+          download_dir="$RUNNER_TEMP/release-verification"
+          mkdir -p "$download_dir"
+          gh release download "$RELEASE_TAG" --dir "$download_dir"
+          diff --recursive --brief dist "$download_dir"
+          cd "$download_dir"
+          sha256sum --check SHA256SUMS.txt
+      - name: Publish the verified draft
+        env:
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+        run: |
+          latest=true
+          if [ "$PRERELEASE" = true ]; then latest=false; fi
+          gh release edit "$RELEASE_TAG" --draft=false \
+            --prerelease="$PRERELEASE" --latest="$latest"
+
+  update-metadata:
+    name: Update the matching Zotero update channel
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_VERSION: ${{ needs.publish.outputs.version }}
+      PRERELEASE: ${{ needs.publish.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Validate Server sources
+      - name: Download published update metadata
+        run: gh release download "$RELEASE_TAG" --pattern update.json --dir metadata
+      - name: Validate the published metadata and select its channel
+        id: channel
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install toml packaging flask pypdf pymupdf
-          python -m compileall -q server
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: 'npm'
-          cache-dependency-path: plugin/package-lock.json
-
-      - name: Install plugin dependencies
-        run: cd plugin/ && npm ci
-
-      - name: Lint plugin
-        run: cd plugin/ && npm run lint:check
-
-      - name: Build plugin
-        run: cd plugin/ && npm run build
-
-      - name: Verify canonical XPI exists
-        run: test -f plugin/build/zotero-pdf-2-zh.xpi
-
-      # Build and validate every artifact before creating/updating the GitHub
-      # Release. This prevents a failed Server packaging step from leaving a
-      # release that contains only the plugin artifact.
-      - name: Build server.zip from tagged source
+          package = json.loads(Path('plugin/package.json').read_text('utf-8'))
+          content = Path('metadata/update.json').read_bytes()
+          metadata = json.loads(content)
+          addon = package['config']['addonID']
+          if set(metadata.get('addons', {})) != {addon}:
+              raise SystemExit('Update metadata contains unexpected addon IDs')
+          updates = metadata['addons'][addon]['updates']
+          expected_link = (
+              f'https://github.com/{os.environ["GH_REPO"]}/releases/download/'
+              f'{os.environ["RELEASE_TAG"]}/zotero-pdf2zh-community.xpi'
+          )
+          if len(updates) != 1 or updates[0]['version'] != os.environ['RELEASE_VERSION']:
+              raise SystemExit('Update metadata version does not match the published release')
+          if updates[0]['update_link'] != expected_link:
+              raise SystemExit('Update metadata does not point to the published XPI')
+          filename = 'update-beta.json' if os.environ['PRERELEASE'] == 'true' else 'update.json'
+          Path('metadata', filename).write_bytes(content)
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'filename={filename}\n')
+          PY
+      - name: Prepare the fixed metadata release
         run: |
-          rm -f server.zip
-          zip -r server.zip server \
-            -x 'server/translated/*' \
-            -x 'server/zotero-pdf2zh-venv/*' \
-            -x 'server/zotero-pdf2zh-next-venv/*' \
-            -x 'server/zotero-pdf2zh-venv.staging/*' \
-            -x 'server/zotero-pdf2zh-next-venv.staging/*' \
-            -x 'server/zotero-pdf2zh-venv.backup/*' \
-            -x 'server/zotero-pdf2zh-next-venv.backup/*' \
-            -x 'server/config/config.json' \
-            -x 'server/config/config.toml' \
-            -x 'server/config/venv.json' \
-            -x 'server/config/package_update_state.json' \
-            -x 'server/config/*.invalid.bak' \
-            -x 'server/config/*.invalid.*.bak' \
-            -x 'server/__pycache__/*' \
-            -x 'server/*/__pycache__/*' \
-            -x 'server/**/*.pyc' \
-            -x '.DS_Store'
-          unzip -l server.zip | head -80
-          unzip -l server.zip | grep -q 'server/server.py'
-          unzip -l server.zip | grep -q 'server/config/config.toml.example'
-          unzip -l server.zip | grep -q 'server/update_packages.py'
-          unzip -l server.zip | grep -q 'server/utils/deepseek_thinking.py'
-
-      - name: Release plugin to GitHub
+          if ! gh release view release --json tagName >/dev/null; then
+            gh release create release --target "$GITHUB_SHA" --draft \
+              --prerelease --latest=false --title 'Zotero update metadata' \
+              --notes 'Stable and beta update metadata for Zotero PDF2zh Community.'
+          fi
+      - name: Upload and verify the selected update channel
+        env:
+          METADATA_FILE: ${{ steps.channel.outputs.filename }}
         run: |
-          cd plugin/ && npm run release
-          sleep 1s
-
-      - name: Upload canonical Release assets
-        run: |
-          gh release upload ${{ github.ref_name }} plugin/build/zotero-pdf-2-zh.xpi --clobber
-          gh release upload ${{ github.ref_name }} server.zip --clobber
-
-      - name: Notify release
-        uses: apexskier/github-release-commenter@v1
-        continue-on-error: true
-        with:
-          comment-template: |
-            :rocket: _This ticket has been resolved in {release_tag}. See {release_link} for release notes._
+          gh release upload release "metadata/$METADATA_FILE" --clobber
+          gh release download release --pattern "$METADATA_FILE" --dir verified-metadata
+          cmp "metadata/$METADATA_FILE" "verified-metadata/$METADATA_FILE"
+      - name: Publish metadata without changing the latest stable release
+        run: gh release edit release --draft=false --prerelease --latest=false

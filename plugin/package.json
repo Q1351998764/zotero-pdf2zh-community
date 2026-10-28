@@ -1,23 +1,26 @@
 {
-    "name": "zotero-pdf2zh",
-    "version": "4.1.7",
-    "description": "PDF translation for Zotero with PDF2zh/PDF2zh_next, bilingual layouts, batch processing, and DeepSeek V4 support.",
+    "name": "zotero-pdf2zh-community",
+    "version": "4.1.8",
+    "description": "Unofficial community-maintained Zotero PDF translation: compatible APIs, managed dependencies, verified assets, and actionable diagnostics.",
     "config": {
-        "addonName": "Zotero PDF2zh",
-        "addonID": "pdf2zh@guaguastandup.com",
-        "addonRef": "pdf2zh",
-        "addonInstance": "pdf2zh",
-        "prefsPrefix": "extensions.zotero.pdf2zh"
+        "addonName": "Zotero PDF2zh Community",
+        "addonID": "pdf2zh-community@q1351998764.github.io",
+        "addonRef": "pdf2zhcommunity",
+        "addonInstance": "pdf2zhCommunity",
+        "prefsPrefix": "extensions.zotero.pdf2zhcommunity"
     },
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/guaguastandup/zotero-pdf2zh.git"
+        "url": "git+https://github.com/Q1351998764/zotero-pdf2zh-community.git"
     },
     "author": "guaguastandup",
+    "contributors": [
+        "Q1351998764 (community maintenance)"
+    ],
     "bugs": {
-        "url": "https://github.com/guaguastandup/zotero-pdf2zh/issues"
+        "url": "https://github.com/Q1351998764/zotero-pdf2zh-community/issues"
     },
-    "homepage": "https://github.com/guaguastandup/zotero-pdf2zh#readme",
+    "homepage": "https://github.com/Q1351998764/zotero-pdf2zh-community#readme",
     "license": "AGPL-3.0-or-later",
     "scripts": {
         "start": "zotero-plugin serve",
@@ -59,5 +62,8 @@
                 }
             }
         ]
+    },
+    "overrides": {
+        "adm-zip": "0.6.1"
     }
 }

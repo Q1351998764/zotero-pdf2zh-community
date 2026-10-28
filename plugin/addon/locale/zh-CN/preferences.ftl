@@ -1,4 +1,4 @@
-pref-title = Zotero PDF2zh
+pref-title = Zotero PDF2zh Community
 pref-help = { $name } Build { $version } { $time }
 
 pref-config          = Zotero PDF2zh配置

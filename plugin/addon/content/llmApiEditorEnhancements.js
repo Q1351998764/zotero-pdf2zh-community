@@ -67,7 +67,8 @@
     function normalizeBaseUrl(value) {
         return String(value || "")
             .trim()
-            .replace(/\/+$/, "");
+            .replace(/\/+$/, "")
+            .replace(/\/chat\/completions$/, "");
     }
 
     function modelRequestSpec(service, baseUrl, apiKey) {
