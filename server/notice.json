@@ -7,11 +7,11 @@
   },
   "notices": [
     {
-      "id": "community-4.1.8",
+      "id": "community-4.1.9",
       "enabled": true,
       "level": "info",
       "affects": [
-        "4.1.8"
+        "4.1.9"
       ],
       "title": "非官方社区维护版",
       "message": "请同时安装社区版插件与Server，并停用原版插件以避免重复任务。"

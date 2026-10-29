@@ -278,6 +278,12 @@ class RealEngineTranslatorContractTest(unittest.TestCase):
 
 class EngineRunnerTest(unittest.TestCase):
     def setUp(self):
+        preflight = patch("utils.asset_downloads.prepare_babeldoc_assets", return_value={"status": "cached"})
+        self.prepare_assets = preflight.start()
+        self.addCleanup(preflight.stop)
+        rich_text = patch.object(engine_runner, "install_rich_text_compat")
+        self.install_rich_text = rich_text.start()
+        self.addCleanup(rich_text.stop)
         self.asset_module = SimpleNamespace(ensure_legacy_rapidocr_asset=Mock(return_value={
             "status": "skipped", "message": "not needed", "required": False,
         }))
@@ -297,6 +303,8 @@ class EngineRunnerTest(unittest.TestCase):
         ):
             self.assertEqual(engine_runner.main(["pdf2zh_next", "paper.pdf", "--lang-out", "zh-CN"]), 7)
         install.assert_called_once_with()
+        self.prepare_assets.assert_called_once_with()
+        self.install_rich_text.assert_called_once_with()
         self.assertIs(sys.argv, original_argv)
 
     def test_logged_whole_file_failure_cannot_exit_successfully(self):
@@ -320,6 +328,8 @@ class EngineRunnerTest(unittest.TestCase):
         ):
             self.assertEqual(engine_runner.main(["pdf2zh", "--help"]), 0)
         install.assert_not_called()
+        self.prepare_assets.assert_not_called()
+        self.install_rich_text.assert_not_called()
 
     def test_help_and_version_do_not_repair_assets_or_install_adapters(self):
         for option in ("--help", "-h", "--version"):
@@ -332,6 +342,8 @@ class EngineRunnerTest(unittest.TestCase):
                     self.assertEqual(engine_runner.main(["pdf2zh_next", option]), 0)
                 install.assert_not_called()
         self.asset_module.ensure_legacy_rapidocr_asset.assert_not_called()
+        self.prepare_assets.assert_not_called()
+        self.install_rich_text.assert_not_called()
 
     def test_required_asset_failure_stops_before_loading_engine(self):
         self.asset_module.ensure_legacy_rapidocr_asset.return_value = {
@@ -345,14 +357,34 @@ class EngineRunnerTest(unittest.TestCase):
             self.assertEqual(engine_runner.main(["pdf2zh_next", "paper.pdf"]), 1)
         load.assert_not_called()
         self.assertIn("模型资产校验失败", stderr.getvalue())
+        self.install_rich_text.assert_not_called()
 
     def test_multiprocessing_spawn_reapplies_adapter_before_worker_runs(self):
         with (
             patch.dict(os.environ, {engine_runner._COMPAT_ENV: "1"}),
             patch("utils.engine_compat.install_openai_response_compat") as install,
+            patch("utils.engine_logging.install_engine_diagnostics") as install_logs,
+            patch("utils.rich_text_compat.install_rich_text_compat") as install_styles,
         ):
             runpy.run_path(str(Path(engine_runner.__file__)), run_name="__mp_main__")
         install.assert_called_once_with()
+        install_logs.assert_called_once_with()
+        install_styles.assert_called_once_with()
+        self.prepare_assets.assert_not_called()
+
+    def test_resource_preflight_failure_stops_before_loading_engine(self):
+        self.prepare_assets.side_effect = RuntimeError("必需资源 fonts/font.ttf 下载失败")
+        with (
+            patch.dict(sys.modules, {"utils.asset_repair": self.asset_module}),
+            patch.object(engine_runner, "_entry_point") as load,
+            patch.object(engine_runner, "install_openai_response_compat") as install,
+            redirect_stderr(StringIO()) as stderr,
+        ):
+            self.assertEqual(engine_runner.main(["pdf2zh_next", "paper.pdf"]), 1)
+        load.assert_not_called()
+        install.assert_not_called()
+        self.assertIn("fonts/font.ttf", stderr.getvalue())
+        self.install_rich_text.assert_not_called()
 
     def test_invalid_engine_is_rejected(self):
         with redirect_stderr(StringIO()):
@@ -394,7 +426,11 @@ class SpawnedEngineIntegrationTest(unittest.TestCase):
                 import multiprocessing
 
                 def worker():
+                    import logging
                     from pdf2zh_next.translator.translator_impl.openai import OpenAITranslator
+                    logging.getLogger("babeldoc.assets.assets").warning(
+                        "ConnectTimeout: resource https://example.invalid/models/long-path/font.ttf"
+                    )
                     translator = OpenAITranslator()
                     assert translator.do_translate("Hello") == "translated"
                     assert translator.do_llm_translate("Glossary") == "translated"
@@ -451,6 +487,12 @@ class SpawnedEngineIntegrationTest(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("SPAWN_TEXT_AND_GLOSSARY_OK", result.stdout)
+            diagnostic_lines = [line for line in result.stderr.splitlines()
+                                if line.startswith("[PDF2ZH_DIAGNOSTIC] ")]
+            self.assertEqual(len(diagnostic_lines), 1, result.stderr)
+            event = json.loads(diagnostic_lines[0].removeprefix("[PDF2ZH_DIAGNOSTIC] "))
+            self.assertEqual(event["logger"], "babeldoc.assets.assets")
+            self.assertIn("https://example.invalid/models/long-path/font.ttf", event["message"])
 
 
 if __name__ == "__main__":

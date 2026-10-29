@@ -14,6 +14,8 @@ import os
 import sys
 
 from utils.engine_compat import install_openai_response_compat
+from utils.engine_logging import install_engine_diagnostics, remove_engine_diagnostics
+from utils.rich_text_compat import install_rich_text_compat
 
 _COMPAT_ENV = "ZOTERO_PDF2ZH_ENGINE_COMPAT"
 
@@ -68,6 +70,7 @@ def main(argv=None):
     previous_argv = sys.argv
     previous_compat = os.environ.get(_COMPAT_ENV)
     observer = _EngineFailureObserver()
+    diagnostic_handlers = []
     # Attach to this namespace rather than root: upstream basicConfig remains
     # free to install its normal RichHandler, and messages still propagate.
     engine_logger = logging.getLogger("pdf2zh_next")
@@ -76,8 +79,10 @@ def main(argv=None):
 
     try:
         if engine == "pdf2zh_next" and not informational:
+            from utils.asset_downloads import prepare_babeldoc_assets
             from utils.asset_repair import ensure_legacy_rapidocr_asset
 
+            diagnostic_handlers = install_engine_diagnostics()
             asset = ensure_legacy_rapidocr_asset()
             if asset["status"] == "failed":
                 print(f"[engine_runner] {asset['message']}", file=sys.stderr)
@@ -85,8 +90,10 @@ def main(argv=None):
                     return 1
             elif asset["status"] == "repaired":
                 print(f"[engine_runner] {asset['message']}", file=sys.stderr)
+            prepare_babeldoc_assets()
             os.environ[_COMPAT_ENV] = "1"
             install_openai_response_compat()
+            install_rich_text_compat()
         else:
             os.environ.pop(_COMPAT_ENV, None)
 
@@ -110,6 +117,7 @@ def main(argv=None):
         print(f"[engine_runner] {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     finally:
+        remove_engine_diagnostics(diagnostic_handlers)
         sys.argv = previous_argv
         if previous_compat is None:
             os.environ.pop(_COMPAT_ENV, None)
@@ -125,7 +133,9 @@ def main(argv=None):
 # same class adapter before constructing their own OpenAI client. Fork workers
 # already inherit the adapter. No sitecustomize/PYTHONPATH injection is needed.
 if __name__ == "__mp_main__" and os.environ.get(_COMPAT_ENV) == "1":
+    install_engine_diagnostics()
     install_openai_response_compat()
+    install_rich_text_compat()
 
 
 if __name__ == "__main__":

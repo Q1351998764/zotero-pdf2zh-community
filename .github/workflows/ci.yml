@@ -94,6 +94,9 @@ jobs:
               'test_deepseek_runner.py',
               'test_openai_config_compat.py',
               'test_managed_environment_isolation.py',
+              'test_asset_downloads.py',
+              'test_engine_logging.py',
+              'test_rich_text_compat.py',
           ))
           result = unittest.TextTestRunner(verbosity=2).run(suite)
           if not result.wasSuccessful() or result.skipped:

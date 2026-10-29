@@ -19,6 +19,7 @@ MAX_LOG_BYTES = 512 * 1024
 MAX_LOG_FILES = 100
 MAX_LOG_AGE = 7 * 24 * 3600
 MAX_LINE_CHARS = 4096
+ENGINE_DIAGNOSTIC_PREFIX = "[PDF2ZH_DIAGNOSTIC] "
 _LOCK = threading.Lock()
 _ACTIVE: set[Path] = set()
 _ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)")
@@ -27,10 +28,39 @@ _SECRET_VALUE = re.compile(
     r'''(?ix)(["']?[\w.-]*(?:api[_-]?key|access[_-]?key|token|secret|password|authorization|credential|auth)[\w.-]*["']?\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}]+)'''
 )
 _URL = re.compile(r"https?://[^\s<>\"']+", re.I)
-_PAYLOAD = re.compile(r'''(?ix)(?:["']?(?:messages|prompt|content|request_body|response_body|body|paragraph|source_text|translated_text|input_value|llm_api|extra_data|config)["']?\s*[:=])''')
+_PAYLOAD = re.compile(r'''(?ix)(?:["']?(?:
+    messages|prompt|content|request_body|response_body|body|paragraph|
+    source_text|translated_text|input_value|input|output|llm_api|extra_data|config|
+    composition|char_unicode|unicode|typesettingunit|
+    llm\s+(?:json\s+)?response(?:\s+after\s+cleaning(?:\s*\(start\))?)?
+)["']?\s*[:=])''')
 _EXCEPTION = re.compile(r"\b(?:[\w.]+(?:Error|Exception)|ReadTimeout|ConnectTimeout|TimeoutError)\s*:")
 _DIAGNOSTIC = re.compile(r"\b(?:ERROR|WARNING|WARN|CRITICAL|FATAL|Traceback)\b|^\s*(?:error|failed|failure|timeout|timed out|retry)\b|^[⚠️❌\s]*(?:失败|错误|超时|重试)")
 _PROGRESS = re.compile(r"\b(?:translate|Running|Parse)\b.{0,100}\d+/\d+|\|\s*\d+/\d+\s+\[", re.I)
+_ASSET_STATUS = re.compile(r"^\[asset_download\] (?:INFO|WARNING|ERROR)\b")
+
+
+def decode_engine_diagnostic(line, secrets=()):
+    """Decode our pre-Rich record without accepting arbitrary JSON payloads.
+
+    The adapter emits only warning/error messages, not traceback locals, log
+    arguments or request objects. Redact again here using task-specific keys.
+    Invalid records are discarded instead of falling through as raw output.
+    """
+    try:
+        event = json.loads(line[len(ENGINE_DIAGNOSTIC_PREFIX):])
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(event, dict) or set(event) != {"level", "logger", "message"}:
+        return ""
+    level, name, message = (event[key] for key in ("level", "logger", "message"))
+    if not isinstance(level, str) or level not in {"WARNING", "ERROR", "CRITICAL"} or not isinstance(name, str):
+        return ""
+    if not re.fullmatch(r"(?:babeldoc|pdf2zh_next)(?:\.[A-Za-z0-9_]+)*", name):
+        return ""
+    if not isinstance(message, str) or len(message.splitlines()) > 1 or "\n" in message or "\r" in message:
+        return ""
+    return f"[engine] {level} {name}: {safe_message(message, secrets)}"[:MAX_LINE_CHARS]
 
 
 def redact(text, secrets=()):
@@ -61,10 +91,18 @@ def safe_message(text, secrets=()):
     """Exclude common request/config dumps, even when embedded in an exception."""
     result = []
     for line in redact(text, secrets).splitlines():
-        match = _PAYLOAD.search(line)
+        # BabelDOC logs input/output text and IL object reprs even at WARNING
+        # level. These are payload boundaries, not useful diagnostic details.
+        # Preserve resource URLs whose *path* happens to contain e.g. input:.
+        urls = [(url.start(), url.end()) for url in _URL.finditer(line)]
+        match = next((candidate for candidate in _PAYLOAD.finditer(line)
+                      if not any(start <= candidate.start() < end for start, end in urls)), None)
         if match:
             line = line[:match.start()] + "[请求/正文内容已省略]"
         result.append(line[:MAX_LINE_CHARS])
+        if match:
+            # A multiline payload can continue without a repeated field label.
+            break
     return "\n".join(result)
 
 
@@ -121,6 +159,9 @@ def error_summary(lines):
             score = 3
         else:
             continue
+        # Prefer an intact pre-Rich record over its later wrapped console copy.
+        if line.startswith("[engine] "):
+            score += 1
         candidates.append((score, index, line))
     if not candidates:
         return ""
@@ -201,12 +242,18 @@ class TaskDiagnostics:
                 handle.write(encoded)
 
     def record(self, line):
-        line = safe_message(line, self.secrets).strip()
+        line = str(line).strip()
+        structured = line.startswith(ENGINE_DIAGNOSTIC_PREFIX)
+        if structured:
+            line = decode_engine_diagnostic(line, self.secrets)
+        else:
+            line = safe_message(line, self.secrets).strip()
         if not line or line == self.last_line:
             return ""
         # Source text, Rich traceback local-variable dumps and full configs are
         # intentionally excluded. This is a diagnostic log, not a raw transcript.
-        if not (_DIAGNOSTIC.search(line[:180]) or _EXCEPTION.search(line[:180]) or _PROGRESS.search(line)
+        if not (structured or _ASSET_STATUS.match(line)
+                or _DIAGNOSTIC.search(line[:180]) or _EXCEPTION.search(line[:180]) or _PROGRESS.search(line)
                 or re.search(r'HTTP(?: Request:|/\d).*?\b[45]\d\d\b', line)
                 or re.match(r'^File "[^\"]+", line \d+', line)):
             return ""

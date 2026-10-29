@@ -1,4 +1,4 @@
-## server.py v4.1.8
+## server.py v4.1.9
 # guaguastandup
 # zotero-pdf2zh
 import os
@@ -40,8 +40,8 @@ from utils.diagnostics import missing_output_error, record_task_error, safe_mess
 
 _VALUE_ERROR_RE = re.compile(r'(?m)^ValueError:\s*(?P<msg>.+)$')
 
-__version__ = "4.1.8"
-update_log = "社区维护版：按任务保存脱敏诊断日志，错误原因关联历史记录；修复空响应、旧模型下载路径与运行环境兼容；独立 GitHub 更新源。请同时更新插件和 Server。"
+__version__ = "4.1.9"
+update_log = "社区维护版：改进首次翻译的模型与字体下载，失败自动切换备用源；保留完整脱敏错误记录；兼容富文本样式标签的双引号写法。请同时更新插件和 Server。"
 
 ############# config file #########
 pdf2zh      = 'pdf2zh'
