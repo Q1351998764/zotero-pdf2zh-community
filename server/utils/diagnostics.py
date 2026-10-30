@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 import json
 import os
@@ -38,6 +38,44 @@ _PAYLOAD = re.compile(r'''(?ix)(?:["']?(?:
 _EXCEPTION = re.compile(r"\b(?:[\w.]+(?:Error|Exception)|ReadTimeout|ConnectTimeout|TimeoutError)\s*:")
 _DIAGNOSTIC = re.compile(r"\b(?:ERROR|WARNING|WARN|CRITICAL|FATAL|Traceback)\b|^\s*(?:error|failed|failure|timeout|timed out|retry)\b|^[⚠️❌\s]*(?:失败|错误|超时|重试)")
 _ASSET_STATUS = re.compile(r"^\[asset_download\] (?:INFO|WARNING|ERROR)\b")
+
+# Only explicit exception names/statuses establish a category. In particular,
+# a generic ValueError/KeyError does not establish a PDF recognition failure,
+# and a connection error does not establish excessive request concurrency.
+_FAILURE_REASONS = (
+    ("rate_limit", "接口限流", r"\bRateLimitError\b|\b(?:HTTP(?:/\d(?:\.\d)?)?|status(?:\s+code)?|Error\s+code)\s*[:=]?\s*429\b",
+     "可降低 QPS 和线程池，并检查服务商配额；限流也可能来自共享额度或服务限制。"),
+    ("timeout", "请求超时", r"\b(?:APITimeoutError|TimeoutError|ReadTimeout|ConnectTimeout|WriteTimeout|PoolTimeout)\b|\b(?:request|connection)\s+timed\s+out\b",
+     "先用低并发测试单页，再检查网络、模型响应时间和超时设置。"),
+    ("connection", "网络/连接异常", r"\b(?:APIConnectionError|RemoteProtocolError|ConnectError|ConnectionError|ConnectionResetError|ConnectionRefusedError)\b|server disconnected without sending",
+     "可先降低 QPS 和线程池测试，再检查代理、网络和服务状态；仅凭连接错误无法确认并发过高。"),
+    ("authentication", "接口认证失败", r"\bAuthenticationError\b|\b(?:HTTP(?:/\d(?:\.\d)?)?|status(?:\s+code)?|Error\s+code)\s*[:=]?\s*401\b",
+     "检查 API Key 是否有效、是否填写到对应服务商；不要分享密钥。"),
+    ("permission", "接口访问被拒绝", r"\bPermissionDeniedError\b|\b(?:HTTP(?:/\d(?:\.\d)?)?|status(?:\s+code)?|Error\s+code)\s*[:=]?\s*403\b",
+     "检查模型访问权限、账户状态和服务商限制；仅凭 403 不能确定具体原因。"),
+    ("service", "接口服务异常", r"\b(?:InternalServerError|ServiceUnavailableError)\b|\b(?:HTTP(?:/\d(?:\.\d)?)?|status(?:\s+code)?|Error\s+code)\s*[:=]?\s*5\d\d\b",
+     "检查服务商状态，稍后重试单页；持续失败时可比较其他有权限使用的模型。"),
+    ("response", "接口响应无法使用", r"\b(?:TranslationResponseError|JSONDecodeError|APIResponseValidationError)\b",
+     "检查日志中的响应格式、空译文或截断提示，再核对模型和输出限制。"),
+    ("document", "文档解析异常", r"\b(?:PDFSyntaxError|PdfReadError|PDFTextExtractionNotAllowed|PDFUnicodeNotDefined)\b",
+     "检查出错页的文字提取、字体或 PDF 结构；仅凭该异常不能判断是正文还是页眉页脚。"),
+)
+
+
+def _paragraph_failure_reason(message, secrets=()):
+    """Return a bounded, redacted cause example and evidence-based guidance."""
+    detail = safe_message(message, secrets).strip()
+    detail = detail.removeprefix("Error translating paragraph.").strip()
+    for code, label, pattern, advice in _FAILURE_REASONS:
+        if re.search(pattern, detail, re.I):
+            break
+    else:
+        code, label, advice = (
+            "other", "其他异常",
+            "查看任务日志的异常类型和上下文；当前证据不足以判断是段落识别、配置还是接口问题。",
+        )
+    return {"code": code, "label": label, "count": 1,
+            "detail": detail[:280] or "日志未保留可识别的具体原因。", "advice": advice}
 
 
 def _decode_engine_event(line):
@@ -199,6 +237,7 @@ class ExecutionResult:
     summary: str
     tail: str
     failed_paragraphs: int = 0
+    failure_reasons: list[dict] = field(default_factory=list)
 
 
 class TranslationProcessError(subprocess.CalledProcessError):
@@ -210,13 +249,6 @@ class TranslationProcessError(subprocess.CalledProcessError):
 
     def __str__(self):
         return self.summary
-
-
-class IncompleteTranslationError(TranslationProcessError):
-    """The child exited zero after leaving failed paragraphs untranslated."""
-    def __init__(self, result):
-        super().__init__(1, result)
-        self.failed_paragraphs = result.failed_paragraphs
 
 
 class MissingOutputError(RuntimeError):
@@ -246,6 +278,7 @@ class TaskDiagnostics:
         self.failed_paragraphs = 0
         self.paragraph_failure_summary = ""
         self._paragraph_failure_ids = set()
+        self._failure_reasons = {}
         directory = Path(log_dir) if log_dir else LOG_DIR
         directory.mkdir(parents=True, exist_ok=True)
         filename = re.sub(r"[^a-zA-Z0-9_-]", "_", self.task_id)[:100] or str(uuid.uuid4())
@@ -305,7 +338,14 @@ class TaskDiagnostics:
                 # Count actual structured events before display deduplication;
                 # Rich's plain-text replay never enters this branch.
                 self.failed_paragraphs += 1
-                self.paragraph_failure_summary = error_summary([line])
+                reason = _paragraph_failure_reason(event["message"], self.secrets)
+                self.paragraph_failure_summary = reason["detail"]
+                if reason["code"] in self._failure_reasons:
+                    current = self._failure_reasons[reason["code"]]
+                    current["count"] += 1
+                    current["detail"] = reason["detail"]
+                else:
+                    self._failure_reasons[reason["code"]] = reason
         else:
             line = safe_message(line, self.secrets).strip()
         if not line or line == self.last_line:
@@ -327,19 +367,24 @@ class TaskDiagnostics:
 
     def finish(self, returncode):
         summary = self.paragraph_failure_summary or error_summary(self.errors)
+        reasons = sorted((dict(reason) for reason in self._failure_reasons.values()),
+                         key=lambda reason: (-reason["count"], reason["code"]))
         failure_count = ""
         if self.failed_paragraphs:
+            categories = "；".join(f"{reason['label']} {reason['count']} 段" for reason in reasons)
             summary = (
-                f"有 {self.failed_paragraphs} 个段落翻译失败并保留原文，任务未完成。"
-                "可能生成的部分 PDF 保留在后端输出目录。"
-                + (f" 原因：{summary}" if summary else "")
+                f"有 {self.failed_paragraphs} 个段落翻译失败并保留原文。原因：{categories}。"
+                + (f" 最近一次：{summary}" if summary else "")
             )
             failure_count = f" paragraph_failures={self.failed_paragraphs}"
+            for reason in reasons:
+                self._append("=== paragraph_failure_reason="
+                             + json.dumps(reason, ensure_ascii=False) + " ===\n")
         self._append(f"=== exit={returncode}{failure_count}" + (f" 摘要：{summary}" if summary else "") + " ===\n")
         with _LOCK:
             _ACTIVE.discard(self.path)
         return ExecutionResult(returncode, str(self.path), summary, "\n".join(self.lines)[-12000:],
-                               failed_paragraphs=self.failed_paragraphs)
+                               failed_paragraphs=self.failed_paragraphs, failure_reasons=reasons)
 
 
 def record_task_error(task_id, exc):

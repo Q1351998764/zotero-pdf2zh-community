@@ -75,4 +75,5 @@ export interface JobProgressUpdate {
     percent?: number;
     detail?: string;
     error?: string;
+    warning?: string;
 }

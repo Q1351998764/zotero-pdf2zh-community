@@ -57,7 +57,7 @@ class TaskManager:
 
     def update_task(self, task_id, updates):
         updates = dict(updates)
-        for key in ("message", "error", "diagnosticSummary", "diagnosticTail"):
+        for key in ("message", "error", "diagnosticSummary", "diagnosticTail", "warning"):
             if key in updates:
                 updates[key] = safe_message(updates[key])
         with self.lock:
@@ -117,7 +117,7 @@ class TaskManager:
                 "message": task.get("message"),
                 "modelName": task.get("modelName"),
             }
-            for key in ("logFile", "logPath", "diagnosticSummary"):
+            for key in ("logFile", "logPath", "diagnosticSummary", "warning", "translationReport"):
                 if task.get(key):
                     history_item[key] = task[key]
             if file_list:

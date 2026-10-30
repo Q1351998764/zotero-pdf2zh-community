@@ -1,4 +1,4 @@
-"""A generated PDF and child exit zero must not hide final paragraph failures."""
+"""Deliver generated PDFs while retaining precise paragraph failure reports."""
 import contextlib
 import importlib.util
 import io
@@ -57,20 +57,28 @@ class PartialTranslationFailureTest(unittest.TestCase):
                 with task_manager.lock:
                     task_manager.active_tasks.pop(task_id, None)
 
-    def assert_final_failure(self, captured, count):
-        error = captured["error"]
-        self.assertIsInstance(error, TranslationProcessError)
-        self.assertNotEqual(error.returncode, 0)
-        self.assertEqual(error.failed_paragraphs, count)
-        self.assertIn(f"{count} 个段落翻译失败", str(error))
-        self.assertIn("保留原文", str(error))
+    def assert_partial_result(self, captured, count):
+        self.assertIsNone(captured["error"])
+        result = captured["result"]
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.failed_paragraphs, count)
+        self.assertIn(str(count), result.summary)
+        self.assertIn("保留原文", result.summary)
+        self.assertNotIn("任务未完成", result.summary)
         self.assertIn("exit=0", captured["log"])
         self.assertIn(f"paragraph_failures={count}", captured["log"])
-        self.assertEqual(captured["state"]["diagnosticSummary"], error.summary)
+        self.assertEqual(captured["state"]["diagnosticSummary"], result.summary)
+        self.assertEqual(captured["state"]["warning"], result.summary)
+        self.assertEqual(captured["state"]["translationReport"], {
+            "failedParagraphs": count, "reasons": result.failure_reasons,
+        })
+        self.assertEqual(sum(reason["count"] for reason in result.failure_reasons), count)
+        for reason in result.failure_reasons:
+            self.assertEqual(set(reason), {"code", "label", "count", "detail", "advice"})
         self.assertTrue(captured["pdf_created"])
         self.assertNotIn(ENGINE_DIAGNOSTIC_PREFIX, captured["log"])
 
-    def test_zero_exit_with_pdf_and_two_identical_final_errors_is_failure(self):
+    def test_zero_exit_with_pdf_and_two_identical_final_errors_returns_report(self):
         captured = self.run_child("""
             install_engine_diagnostics()
             # Preserve normal console logging too: each failure has both the
@@ -84,9 +92,12 @@ class PartialTranslationFailureTest(unittest.TestCase):
                     logger.exception('Error translating paragraph. Paragraph: PRIVATE_PAPER. Error: test-private-provider-key')
             Path('output.pdf').write_bytes(b'%PDF-1.4\\n%%EOF\\n')
         """)
-        self.assert_final_failure(captured, 2)
-        self.assertIn("ConnectionError: Connection error.", str(captured["error"]))
-        for text in (captured["log"], captured["console"], str(captured["error"])):
+        self.assert_partial_result(captured, 2)
+        self.assertIn("ConnectionError: Connection error.", captured["result"].summary)
+        self.assertEqual(captured["result"].failure_reasons[0]["code"], "connection")
+        self.assertEqual(captured["result"].failure_reasons[0]["count"], 2)
+        for text in (captured["log"], captured["console"], captured["result"].summary,
+                     str(captured["result"].failure_reasons)):
             self.assertNotIn("PRIVATE_PAPER", text)
             self.assertNotIn("test-private-provider-key", text)
 
@@ -127,7 +138,7 @@ class PartialTranslationFailureTest(unittest.TestCase):
             sys.stdout.flush()
             Path('output.pdf').write_bytes(b'%PDF-1.4\\n%%EOF\\n')
         """)
-        self.assert_final_failure(captured, 1)
+        self.assert_partial_result(captured, 1)
         self.assertIn("[engine] ERROR babeldoc.format.pdf.document_il.midend.il_translator:", captured["log"])
         self.assertIn("Server disconnected without sending a response.", captured["log"])
         self.assertIn("translate 2/2", captured["console"])
@@ -159,7 +170,7 @@ class PartialTranslationFailureTest(unittest.TestCase):
                 assert process.exitcode == 0, process.exitcode
                 Path('output.pdf').write_bytes(b'%PDF-1.4\\n%%EOF\\n')
         """)
-        self.assert_final_failure(captured, 1)
+        self.assert_partial_result(captured, 1)
         self.assertIn("Worker translation connection failed.", captured["log"])
         self.assertNotIn("PRIVATE_WORKER_PAPER", captured["log"])
 
@@ -201,12 +212,24 @@ class PartialTranslationFailureTest(unittest.TestCase):
             progress.advance.assert_called_once_with()
             Path('output.pdf').write_bytes(b'%PDF-1.4\\n%%EOF\\n')
         """)
-        self.assert_final_failure(captured, 1)
+        self.assert_partial_result(captured, 1)
         self.assertEqual(captured["state"]["progress"], 99)
         self.assertIn("translate 1/1", captured["console"])
-        self.assertIn("APIConnectionError: Connection error.", str(captured["error"]))
+        self.assertIn("APIConnectionError: Connection error.", captured["result"].summary)
         self.assertNotIn("PRIVATE_SYNTHETIC_ORIGINAL", captured["log"])
         self.assertNotIn("PRIVATE_SYNTHETIC_ORIGINAL", captured["console"])
+
+    def test_actual_nonzero_exit_still_fails_even_if_a_pdf_was_created(self):
+        captured = self.run_child("""
+            install_engine_diagnostics()
+            logging.getLogger('pdf2zh_next.high_level').error('Translation error: fatal engine failure')
+            Path('output.pdf').write_bytes(b'%PDF-1.4\\n%%EOF\\n')
+            sys.exit(7)
+        """)
+        self.assertTrue(captured["pdf_created"])
+        self.assertIsInstance(captured["error"], TranslationProcessError)
+        self.assertEqual(captured["error"].returncode, 7)
+        self.assertIn("fatal engine failure", str(captured["error"]))
 
 
 if __name__ == "__main__":

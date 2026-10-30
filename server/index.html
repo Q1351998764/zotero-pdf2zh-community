@@ -186,12 +186,14 @@
       .task-card:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
       .task-card.completed { border-left-color: #2e7d32; }
       .task-card.failed { border-left-color: #c62828; }
+      .task-card.warning { border-left-color: #b7791f; }
       .task-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
       .task-filename { font-size: 16px; font-weight: 600; color: #333; }
       .task-badge { padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: 600; }
       .task-badge.active { background: #e3fcef; color: #00a86b; }
       .task-badge.completed { background: #e8f5e9; color: #2e7d32; }
       .task-badge.failed { background: #ffebee; color: #c62828; }
+      .task-badge.warning { background: #fff3cd; color: #805600; }
       .task-progress-bar { width: 100%; height: 8px; background: #e0e0e0; border-radius: 4px; overflow: hidden; }
       .task-progress-fill { height: 100%; background: linear-gradient(90deg, #667eea, #764ba2); transition: width 0.3s; }
       .task-info {
@@ -204,6 +206,7 @@
       .task-message { margin-top: 10px; padding: 8px 12px; background: #fff3cd; border-radius: 6px; font-size: 13px; display: none; }
       .task-message.error { background: #ffebee; color: #c62828; }
       .task-message.success { background: #e8f5e9; color: #2e7d32; }
+      .task-message.warning, .warning-message { background: #fff3cd; color: #805600; white-space: pre-wrap; overflow-wrap: anywhere; }
       /* Per-task config toggle */
       .task-config-toggle {
         margin-top: 8px; font-size: 12px; color: #667eea; cursor: pointer;
@@ -236,12 +239,14 @@
       .history-item:hover { transform: translateX(5px); background: #f1f3f5; }
       .history-item.failed { border-left-color: #c62828; }
       .history-item.success { border-left-color: #2e7d32; }
+      .history-item.warning { border-left-color: #b7791f; }
       .history-summary { display: flex; justify-content: space-between; align-items: center; }
       .history-filename { font-size: 16px; font-weight: 600; color: #333; }
       .history-time { font-size: 12px; color: #888; margin-top: 4px; }
       .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
       .status-dot.success { background-color: #2e7d32; }
       .status-dot.failed { background-color: #c62828; }
+      .status-dot.warning { background-color: #b7791f; }
       .status-text { font-size: 13px; font-weight: 600; color: #555; }
       .history-details {
         display: none; margin-top: 15px; padding-top: 15px;
@@ -270,6 +275,11 @@
       .file-btn.download { border-right: 1px solid #e0e0e0; }
       .file-btn svg { width: 14px; height: 14px; }
       .error-message { background: #ffebee; color: #c62828; padding: 10px; border-radius: 6px; margin-top: 10px; font-size: 13px; }
+      .warning-message { padding: 10px; border-radius: 6px; margin-top: 10px; font-size: 13px; }
+      .translation-report { margin-top: 10px; font-size: 13px; color: #555; overflow-wrap: anywhere; }
+      .translation-report summary { cursor: pointer; color: #805600; font-weight: 600; }
+      .translation-report li { margin: 8px 0; }
+      .translation-report .report-detail { margin-top: 4px; white-space: pre-wrap; }
       .empty-state { text-align: center; padding: 60px 20px; color: #666; }
       .empty-state svg { width: 80px; height: 80px; margin-bottom: 20px; opacity: 0.3; }
 
@@ -473,6 +483,7 @@
       let lastTasksList = [];
       const notifiedTaskIds = new Set();
       const expandedConfigTasks = new Set();  // 记录展开的配置任务ID
+      const expandedReportTasks = new Set();  // SSE 重绘时保留报告展开状态
 
       // 默认提示音 (引用本地文件)
       const DEFAULT_DING_SOUND = "/bo.mp3";
@@ -570,6 +581,38 @@
         const m = Math.floor(seconds / 60), s = seconds % 60;
         return `${m}分${s.toString().padStart(2,"0")}秒`;
       }
+      function escapeHtml(value) {
+        return String(value ?? "").replace(/[&<>"']/g, ch => ({"&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"}[ch]));
+      }
+      function taskWarning(task) {
+        const warning = task.warning || task.result?.warning;
+        if (typeof warning === "string" && warning.trim()) return warning.trim();
+        const report = task.translationReport || task.result?.translationReport;
+        const count = report?.failedParagraphs;
+        return Number.isInteger(count) && count > 0 ? `有 ${count} 个段落未译并保留原文，PDF 仍可下载；具体原因见任务日志。` : "";
+      }
+      function renderTranslationReport(task) {
+        const report = task.translationReport || task.result?.translationReport;
+        const reasons = Array.isArray(report?.reasons) ? report.reasons.filter(reason => reason && typeof reason === "object" && Number.isInteger(reason.count) && reason.count > 0) : [];
+        if (!reasons.length) return "";
+        const rows = reasons.map(reason => {
+          const label = typeof reason.label === "string" ? reason.label : "其他错误";
+          const detail = typeof reason.detail === "string" && reason.detail ? `<div class="report-detail">日志：${escapeHtml(reason.detail)}</div>` : "";
+          const advice = typeof reason.advice === "string" && reason.advice ? `<div class="report-detail">建议：${escapeHtml(reason.advice)}</div>` : "";
+          return `<li><strong>${escapeHtml(label)}：${reason.count} 段</strong>${detail}${advice}</li>`;
+        }).join("");
+        const taskId = typeof task.taskId === "string" ? task.taskId : "";
+        const open = taskId && expandedReportTasks.has(taskId) ? " open" : "";
+        return `<details class="translation-report" data-report-task-id="${escapeHtml(taskId)}"${open} ontoggle="rememberReportOpen(this)" onclick="event.stopPropagation()"><summary>查看未译段落原因（按日志归类）</summary><ul>${rows}</ul></details>`;
+      }
+      function rememberReportOpen(details) {
+        // Ignore queued toggle events from a details element replaced by SSE.
+        if (!details.isConnected) return;
+        const taskId = details.dataset.reportTaskId;
+        if (!taskId) return;
+        if (details.open) expandedReportTasks.add(taskId);
+        else expandedReportTasks.delete(taskId);
+      }
       // 渲染配置摘要 HTML
       function renderConfigHtml(cfg) {
         if (!cfg) return '';
@@ -584,7 +627,7 @@
           let val = v;
           if (Array.isArray(v)) val = v.join(', ') || '-';
           if (typeof v === 'boolean') val = v ? '是' : '否';
-          return `<div class="config-row"><span class="config-key">${label}</span><span class="config-val">${val}</span></div>`;
+          return `<div class="config-row"><span class="config-key">${escapeHtml(label)}</span><span class="config-val">${escapeHtml(val)}</span></div>`;
         }).join('');
       }
 
@@ -651,7 +694,7 @@
         const raw = (task.status || "").toString(), isActive = !!task.active;
         if (isActive) return { state:"active", badgeText:"翻译中", badgeClass:"active" };
         const low = raw.toLowerCase();
-        if (raw==="完成"||raw==="翻译成功"||low==="success") return { state:"success", badgeText:"成功", badgeClass:"completed" };
+        if (raw==="完成"||raw==="翻译成功"||low==="success") return { state:"success", badgeText:taskWarning(task)?"完成（有未译段落）":"成功", badgeClass:taskWarning(task)?"warning":"completed" };
         if (raw==="失败"||raw==="翻译失败"||raw==="报错"||low==="failed"||low==="error") return { state:"failed", badgeText:"失败", badgeClass:"failed" };
         return { state:"idle", badgeText: raw||"等待中", badgeClass:"" };
       }
@@ -695,39 +738,41 @@
           tasksContainer.innerHTML = shown.map(task => {
             const taskId = task.taskId || "unknown", isActive = !!task.active;
             const n = normalizeTaskState(task);
+            const warning = n.state === "success" ? taskWarning(task) : "";
             let progress = Number.isFinite(task.progress) ? task.progress : parseInt(task.progress||"0",10);
             if (!Number.isFinite(progress)) progress = 0;
             if (n.state==="success") progress = 100;
             let cardClass = "task-card", badgeClass = "task-badge", badgeText = n.badgeText;
             if (n.state==="active") { badgeClass+=" active"; updateTaskTimer(taskId, task.startTime); }
-            else if (n.state==="success") { cardClass+=" completed"; badgeClass+=" completed"; stopTaskTimer(taskId); }
+            else if (n.state==="success") { cardClass+=warning?" warning":" completed"; badgeClass+=warning?" warning":" completed"; stopTaskTimer(taskId); }
             else if (n.state==="failed") { cardClass+=" failed"; badgeClass+=" failed"; stopTaskTimer(taskId); }
             else { stopTaskTimer(taskId); }
             let elapsed = "-";
             if (task.startTime) {
-              if (isActive) elapsed = `<span id="elapsedTime-${taskId}">计算中...</span>`;
+              if (isActive) elapsed = `<span id="elapsedTime-${escapeHtml(taskId)}">计算中...</span>`;
               else { elapsed = formatDuration(Math.floor(((task.endTime?new Date(task.endTime):new Date()) - new Date(task.startTime)) / 1000)); }
             }
             let msgHtml = "";
-            if (task.message) { let mc = "task-message"; if(n.state==="failed") mc+=" error"; else if(n.state==="success") mc+=" success"; msgHtml = `<div class="${mc}" style="display:block">${task.message}</div>`; }
+            const message = warning || task.message;
+            if (message) { let mc = "task-message"; if(n.state==="failed") mc+=" error"; else if(warning) mc+=" warning"; else if(n.state==="success") mc+=" success"; msgHtml = `<div class="${mc}" style="display:block">${escapeHtml(message)}</div>`; }
             // 配置摘要
             let cfgHtml = '';
             if (task.config) {
               const isExpanded = expandedConfigTasks.has(taskId);
               cfgHtml = `<div class="task-config-toggle ${isExpanded?'expanded':''}" onclick="toggleTaskConfig(this)">${isExpanded ? '收起配置 ▲' : '查看翻译配置 ▼'}</div><div class="task-config-detail ${isExpanded?'show':''} config-display">${renderConfigHtml(task.config)}</div>`;
             }
-            return `<div class="${cardClass}" id="task-${taskId}">
-              <div class="task-header"><div class="task-filename">${task.fileName||"未知文件"}</div><div class="${badgeClass}">${badgeText}</div></div>
+            return `<div class="${cardClass}" id="task-${escapeHtml(taskId)}">
+              <div class="task-header"><div class="task-filename">${escapeHtml(task.fileName||"未知文件")}</div><div class="${badgeClass}">${escapeHtml(badgeText)}</div></div>
               <div class="task-progress-bar"><div class="task-progress-fill" style="width:${progress}%"></div></div>
               <div class="task-info">
                 <div class="task-info-item"><div class="task-info-label">进度</div><div class="task-info-value">${progress}%</div></div>
                 <div class="task-info-item"><div class="task-info-label">开始</div><div class="task-info-value">${formatTime(task.startTime)}</div></div>
-                <div class="task-info-item"><div class="task-info-label">引擎</div><div class="task-info-value">${task.engine||"-"}</div></div>
-                <div class="task-info-item"><div class="task-info-label">服务</div><div class="task-info-value">${task.service||"-"}</div></div>
-                <div class="task-info-item"><div class="task-info-label">模型</div><div class="task-info-value" title="${task.modelName||'-'}">${task.modelName||'默认模型'}</div></div>
+                <div class="task-info-item"><div class="task-info-label">引擎</div><div class="task-info-value">${escapeHtml(task.engine||"-")}</div></div>
+                <div class="task-info-item"><div class="task-info-label">服务</div><div class="task-info-value">${escapeHtml(task.service||"-")}</div></div>
+                <div class="task-info-item"><div class="task-info-label">模型</div><div class="task-info-value" title="${escapeHtml(task.modelName||'-')}">${escapeHtml(task.modelName||'默认模型')}</div></div>
                 <div class="task-info-item"><div class="task-info-label">耗时</div><div class="task-info-value">${elapsed}</div></div>
               </div>
-              ${msgHtml}${cfgHtml}
+              ${msgHtml}${warning?renderTranslationReport(task):""}${cfgHtml}
             </div>`;
           }).join("");
         }
@@ -778,7 +823,8 @@
           return;
         }
         el.innerHTML = history.map(item => {
-          const isSuccess = item.status==="success", sc = isSuccess?"success":"failed", st = isSuccess?"成功":"失败";
+          const isSuccess = item.status==="success", warning = isSuccess ? taskWarning(item) : "";
+          const sc = warning?"warning":isSuccess?"success":"failed", st = warning?"完成（有未译段落）":isSuccess?"成功":"失败";
           const duration = calculateDuration(item.startTime, item.endTime), timeStr = formatTime(item.startTime);
           // 文件按钮
           let filesHtml = "";
@@ -786,20 +832,22 @@
             filesHtml = `<div class="history-files" onclick="event.stopPropagation()">${item.fileList.map(file => {
               const url = `/translatedFile/${encodeURIComponent(file)}`, ft = getFileTypeLabel(file);
               const tag = ft.code ? `<span class="file-type-tag"><span class="ft-code">${ft.code}</span><span class="ft-desc">${ft.desc}</span></span>` : `<span class="file-type-tag"><span class="ft-desc">${ft.desc}</span></span>`;
-              return `<div class="file-action-group">${tag}<a href="${url}" class="file-btn download" download title="下载 ${ft.code||file}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>下载</a><button onclick="openPdfPreview('${url}?preview=true','${file}')" class="file-btn preview" title="预览 ${ft.code||file}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path><path d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path></svg>预览</button></div>`;
+              return `<div class="file-action-group">${tag}<a href="${escapeHtml(url)}" class="file-btn download" download title="下载 ${escapeHtml(ft.code||file)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>下载</a><button data-url="${escapeHtml(url)}?preview=true" data-filename="${escapeHtml(file)}" onclick="openPdfPreview(this.dataset.url,this.dataset.filename)" class="file-btn preview" title="预览 ${escapeHtml(ft.code||file)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path><path d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path></svg>预览</button></div>`;
             }).join("")}</div>`;
           }
-          let errorHtml = !isSuccess && item.error ? `<div class="error-message"><strong>错误信息:</strong> ${item.error}</div>` : "";
+          let errorHtml = !isSuccess && item.error ? `<div class="error-message"><strong>错误信息:</strong> ${escapeHtml(item.error)}</div>` : "";
+          const warningHtml = warning ? `<div class="warning-message"><strong>翻译提示:</strong> ${escapeHtml(warning)}</div>` : "";
           // 配置摘要
           let cfgSection = "";
           if (item.config) {
             cfgSection = `<div style="margin-top:10px"><strong style="font-size:13px;color:#333">翻译配置:</strong><div class="config-display" style="margin-top:6px">${renderConfigHtml(item.config)}</div></div>`;
           }
           return `<div class="history-item ${sc}" onclick="toggleHistoryItem(this)">
-            <div class="history-summary"><div><div class="history-filename">${item.fileName||"未知文件"}</div><div class="history-time">${timeStr}</div></div><div style="display:flex;align-items:center"><span class="status-dot ${sc}"></span><span class="status-text">${st}</span></div></div>
+            <div class="history-summary"><div><div class="history-filename">${escapeHtml(item.fileName||"未知文件")}</div><div class="history-time">${timeStr}</div></div><div style="display:flex;align-items:center"><span class="status-dot ${sc}"></span><span class="status-text">${st}</span></div></div>
+            ${warningHtml}
             <div class="history-details">
-              <div class="meta-grid"><div><strong>引擎:</strong> ${item.engine||"-"}</div><div><strong>服务:</strong> ${item.service||"-"}</div><div><strong>模型:</strong> ${item.modelName||'默认模型'}</div><div><strong>耗时:</strong> ${duration}</div><div><strong>结束:</strong> ${formatTime(item.endTime)}</div></div>
-              ${cfgSection}${filesHtml}${errorHtml}
+              <div class="meta-grid"><div><strong>引擎:</strong> ${escapeHtml(item.engine||"-")}</div><div><strong>服务:</strong> ${escapeHtml(item.service||"-")}</div><div><strong>模型:</strong> ${escapeHtml(item.modelName||'默认模型')}</div><div><strong>耗时:</strong> ${duration}</div><div><strong>结束:</strong> ${formatTime(item.endTime)}</div></div>
+              ${warning?renderTranslationReport(item):""}${cfgSection}${filesHtml}${errorHtml}
             </div>
           </div>`;
         }).join("");

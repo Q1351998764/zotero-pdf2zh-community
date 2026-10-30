@@ -12,8 +12,7 @@ from unittest.mock import patch
 SERVER = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SERVER))
 
-from utils.diagnostics import (ENGINE_DIAGNOSTIC_PREFIX, IncompleteTranslationError,
-                               TaskDiagnostics, TranslationProcessError,
+from utils.diagnostics import (ENGINE_DIAGNOSTIC_PREFIX, TaskDiagnostics, TranslationProcessError,
                                collect_secrets, missing_output_error, redact)
 from utils.execute import _execute_captured
 from utils.task_manager import TaskManager, task_manager
@@ -118,13 +117,11 @@ class TaskDiagnosticsTests(unittest.TestCase):
             self.assertEqual(result.failed_paragraphs, 3)
             self.assertIn("3 个段落翻译失败", result.summary)
             self.assertIn("APIConnectionError", result.summary)
-            error = IncompleteTranslationError(result)
-            self.assertIsInstance(error, TranslationProcessError)
-            self.assertEqual(error.returncode, 1)
-            self.assertEqual(error.failed_paragraphs, 3)
-            self.assertEqual(error.log_path, result.log_path)
-            self.assertEqual(str(error), result.summary)
-            text = Path(result.log_path).read_text(encoding="utf-8") + str(error)
+            self.assertEqual(result.failure_reasons[0]["code"], "connection")
+            self.assertEqual(result.failure_reasons[0]["count"], 3)
+            self.assertNotIn("任务未完成", result.summary)
+            self.assertNotIn("已生成", result.summary)
+            text = Path(result.log_path).read_text(encoding="utf-8") + json.dumps(result.failure_reasons)
             self.assertNotIn(secret, text)
             self.assertIn("exit=0 paragraph_failures=3", text)
 
@@ -147,6 +144,7 @@ class TaskDiagnosticsTests(unittest.TestCase):
                 self.assertEqual(diagnostic.record(invalid), "")
             result = diagnostic.finish(0)
             self.assertEqual(result.failed_paragraphs, 0)
+            self.assertEqual(result.failure_reasons, [])
             self.assertNotIn("任务未完成", result.summary)
             self.assertNotIn("paragraph_failures", Path(result.log_path).read_text(encoding="utf-8"))
 
@@ -171,12 +169,81 @@ class TaskDiagnosticsTests(unittest.TestCase):
             self.assertEqual(diagnostic.record(event), "")
             result = diagnostic.finish(0)
             self.assertEqual(result.failed_paragraphs, 1)
+            self.assertEqual(result.failure_reasons[0]["count"], 1)
+            self.assertEqual(result.failure_reasons[0]["code"], "connection")
             self.assertNotIn("APIConnectionError", result.tail)
             self.assertIn("APIConnectionError", result.summary)
             files = list(Path(directory).glob("*.log*"))
             self.assertEqual(len(files), 2)
             self.assertTrue(all(path.stat().st_size <= 1024 for path in files))
             self.assertIn("paragraph_failures=1", Path(result.log_path).read_text(encoding="utf-8"))
+
+    def test_failure_reasons_classify_only_explicit_evidence(self):
+        cases = (
+            ("RateLimitError: request limit reached", "rate_limit"),
+            ("HTTP/1.1 429 Too Many Requests", "rate_limit"),
+            ("Error code: 429 - quota exceeded", "rate_limit"),
+            ("APITimeoutError: request timed out", "timeout"),
+            ("ReadTimeout: waiting for response", "timeout"),
+            ("RemoteProtocolError: Server disconnected without sending a response", "connection"),
+            ("AuthenticationError: key rejected", "authentication"),
+            ("HTTP 403 Forbidden", "permission"),
+            ("InternalServerError: server failed", "service"),
+            ("HTTP/2 503 Unavailable", "service"),
+            ("TranslationResponseError: choices is empty", "response"),
+            ("JSONDecodeError: invalid response", "response"),
+            ("PDFSyntaxError: unexpected end of page", "document"),
+            ("PdfReadError: invalid document structure", "document"),
+            ("ValueError: cannot parse value", "other"),
+            ("KeyError: missing field", "other"),
+            ("Could not translate paragraph", "other"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = TaskDiagnostics("causes", log_dir=directory)
+            for index, (detail, _) in enumerate(cases):
+                diagnostic.record(self.engine_event("Error translating paragraph. " + detail,
+                                                    event_id=f"{index:032x}"))
+            result = diagnostic.finish(0)
+        counts = {}
+        for _, code in cases:
+            counts[code] = counts.get(code, 0) + 1
+        self.assertEqual({reason["code"]: reason["count"] for reason in result.failure_reasons}, counts)
+        self.assertEqual(result.failed_paragraphs, len(cases))
+        connection = next(reason for reason in result.failure_reasons if reason["code"] == "connection")
+        self.assertIn("无法确认并发过高", connection["advice"])
+        other = next(reason for reason in result.failure_reasons if reason["code"] == "other")
+        self.assertEqual(other["label"], "其他异常")
+        self.assertIn("证据不足", other["advice"])
+        for reason in result.failure_reasons:
+            self.assertEqual(set(reason), {"code", "label", "count", "detail", "advice"})
+
+    def test_failure_examples_are_redacted_bounded_and_survive_long_logs(self):
+        secret = "private-provider-secret-value"
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = TaskDiagnostics("bounded-causes", (secret,), log_dir=directory, max_bytes=2048)
+            diagnostic.record(self.engine_event(
+                "Error translating paragraph. APIConnectionError: credential=" + secret,
+                event_id="1" * 32,
+            ))
+            diagnostic.record(self.engine_event(
+                "Error translating paragraph. JSONDecodeError: response_body=PRIVATE_RESPONSE",
+                event_id="2" * 32,
+            ))
+            diagnostic.record(self.engine_event(
+                "Error translating paragraph. RuntimeError: " + "x" * 500 + " PRIVATE_TAIL",
+                event_id="3" * 32,
+            ))
+            for index in range(120):
+                diagnostic.record(f"WARNING unrelated retry {index} " + "y" * 90)
+            result = diagnostic.finish(0)
+            text = Path(result.log_path).read_text(encoding="utf-8")
+        serialized = json.dumps(result.failure_reasons, ensure_ascii=False) + result.summary
+        for private in (secret, "PRIVATE_RESPONSE", "PRIVATE_TAIL"):
+            self.assertNotIn(private, serialized)
+        self.assertEqual(sum(reason["count"] for reason in result.failure_reasons), 3)
+        self.assertTrue(all(len(reason["detail"]) <= 280 for reason in result.failure_reasons))
+        self.assertIn("接口响应无法使用", result.summary)
+        self.assertIn("paragraph_failures=3", text)
 
     def test_sampled_progress_keeps_redaction_and_deduplication(self):
         with tempfile.TemporaryDirectory() as directory:

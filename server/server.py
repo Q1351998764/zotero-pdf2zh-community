@@ -1,4 +1,4 @@
-## server.py v4.1.11
+## server.py v4.1.12
 # guaguastandup
 # zotero-pdf2zh
 import os
@@ -40,8 +40,8 @@ from utils.diagnostics import missing_output_error, record_task_error, safe_mess
 
 _VALUE_ERROR_RE = re.compile(r'(?m)^ValueError:\s*(?P<msg>.+)$')
 
-__version__ = "4.1.11"
-update_log = "社区维护版：段落翻译失败并保留原文时，不再把生成的 PDF 报为翻译成功；GitHub API 限额时通过公开发布清单检查更新。本次只需更新 Server，已有 XPI 可继续使用。"
+__version__ = "4.1.12"
+update_log = "社区维护版：撤回 4.1.11 的单段失败阻断规则，已生成的 PDF 照常交付，并报告未译段落数及失败原因。更新 Server 即可恢复交付；配套新版 XPI 可在 Zotero 内显示警告摘要。"
 
 ############# config file #########
 pdf2zh      = 'pdf2zh'
@@ -289,14 +289,21 @@ class PDFTranslator:
                 existing.append(os.path.abspath(path))
         return existing
 
-    def _success_files_payload(self, paths):
+    def _success_files_payload(self, paths, task_id=None):
         existing = self._existing_output_files(paths)
-        return {
+        payload = {
             'status': 'success',
             'fileList': [os.path.basename(p) for p in existing],
             'outputDir': os.path.abspath(output_folder),
             'filePaths': existing,
         }
+        task = task_manager.get_task(task_id) if task_id is not None else None
+        if task and task.get('warning'):
+            # Additional fields leave the original XPI's success/fileList
+            # contract intact while newer clients can explain partial output.
+            payload['warning'] = safe_message(task['warning'])
+            payload['translationReport'] = task.get('translationReport', {})
+        return payload
 
     def _success_files_response(self, paths):
         return jsonify(self._success_files_payload(paths)), 200
@@ -409,9 +416,12 @@ class PDFTranslator:
             return self._handle_exception(exc, context=context, task_id=task_id)
 
     def _complete_job_files(self, task_id, paths, message):
-        payload = self._success_files_payload(paths)
+        payload = self._success_files_payload(paths, task_id)
         if not payload['fileList']:
             raise missing_output_error(task_id)
+        if payload.get('warning'):
+            message = f"{message}；{payload['warning']}"
+            payload['message'] = message
         task_manager.complete_task(
             task_id,
             'success',
@@ -627,22 +637,12 @@ class PDFTranslator:
             print(f"⚠️ 期望生成但不存在: {m}")
         for f in existing:
             size = os.path.getsize(f)
-            print(f"🐲 翻译成功, 生成文件: {f}, 大小为: {size/1024.0/1024.0:.2f} MB")
+            print(f"🐲 已生成文件: {f}, 大小为: {size/1024.0/1024.0:.2f} MB")
 
         if not existing:
             raise missing_output_error(task_id)
 
-        payload = self._success_files_payload(existing)
-        task_manager.complete_task(
-            task_id,
-            'success',
-            f'成功生成 {len(existing)} 个文件',
-            file_list=payload['fileList'],
-            file_paths=payload['filePaths'],
-            output_dir=payload['outputDir'],
-            result=payload,
-        )
-        return payload
+        return self._complete_job_files(task_id, existing, f'已生成 {len(existing)} 个文件')
 
     def _record_task_failure(self, task_id, exc):
         message, log_path = record_task_error(task_id, exc)
@@ -1163,7 +1163,7 @@ class PDFTranslator:
 
         for f in existing:
             size = os.path.getsize(f)
-            print(f"🐲 pdf2zh_next 翻译成功, 生成文件: {f}, 大小为: {size/1024.0/1024.0:.2f} MB")
+            print(f"🐲 pdf2zh_next 已生成文件: {f}, 大小为: {size/1024.0/1024.0:.2f} MB")
 
         if not existing:
             raise missing_output_error(task_id, execution)

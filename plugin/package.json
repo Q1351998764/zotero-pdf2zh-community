@@ -1,6 +1,6 @@
 {
     "name": "zotero-pdf2zh-community",
-    "version": "4.1.11",
+    "version": "4.1.12",
     "description": "Unofficial community-maintained Zotero PDF translation: compatible APIs, managed dependencies, verified assets, and actionable diagnostics.",
     "config": {
         "addonName": "Zotero PDF2zh Community",

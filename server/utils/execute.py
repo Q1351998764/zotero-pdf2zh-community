@@ -8,7 +8,7 @@ import threading
 
 from utils.deepseek_thinking import prepare_deepseek_runtime_command
 from utils.diagnostics import (
-    MAX_LINE_CHARS, IncompleteTranslationError, TaskDiagnostics,
+    MAX_LINE_CHARS, TaskDiagnostics,
     TranslationProcessError, collect_secrets, safe_message,
 )
 from utils.environment_lifecycle import managed_python_env
@@ -139,13 +139,25 @@ def _execute_captured(final_cmd, final_env, task_id, *, cwd=None, log_dir=None):
         raise TranslationProcessError(-1, result) from None
     task_manager.update_task(task_id, {
         "diagnosticSummary": result.summary, "diagnosticTail": result.tail,
+        "warning": result.summary if result.failed_paragraphs else "",
+        "translationReport": {
+            "failedParagraphs": result.failed_paragraphs,
+            "reasons": result.failure_reasons,
+        } if result.failed_paragraphs else {},
     })
     if result.returncode:
         raise TranslationProcessError(result.returncode, result)
     if result.failed_paragraphs:
-        # BabelDOC may keep the source paragraph and still create PDFs/exit 0.
-        # A file's existence alone does not make that an accepted translation.
-        raise IncompleteTranslationError(result)
+        # Keep the generated output usable. The caller still checks for actual
+        # PDFs before returning success, with this warning attached.
+        with _CONSOLE_LOCK:
+            try:
+                print(f"[{diagnostic.task_id[:8]}] WARNING: {result.summary}", flush=True)
+                for reason in result.failure_reasons:
+                    print(f"[{diagnostic.task_id[:8]}] {reason['label']} {reason['count']} 段："
+                          f"{reason['detail']} 排查建议：{reason['advice']}", flush=True)
+            except (OSError, UnicodeError):
+                pass
     return result
 
 

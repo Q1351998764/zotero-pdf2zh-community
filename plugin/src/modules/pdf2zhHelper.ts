@@ -13,6 +13,7 @@ import {
     JobProgressUpdate,
 } from "./pdf2zhTypes";
 import { loadLLMApisFromPrefs } from "./preferenceScript";
+import { completedTaskPayload, translationWarning } from "./pdf2zhResultUtils";
 
 export class PDF2zhHelperFactory {
     // 翻译请求本身不要重试，避免同一篇 PDF 被重复翻译。
@@ -146,9 +147,16 @@ export class PDF2zhHelperFactory {
                 });
                 break;
             case "file-done":
-                text = getString("operation-progress-file-done", {
-                    args: { fileName: update.fileName },
-                });
+                text = update.warning
+                    ? getString("operation-progress-file-warning", {
+                          args: {
+                              fileName: update.fileName,
+                              message: update.warning,
+                          },
+                      })
+                    : getString("operation-progress-file-done", {
+                          args: { fileName: update.fileName },
+                      });
                 break;
             case "file-failed":
                 text = getString("operation-progress-file-failed", {
@@ -258,7 +266,12 @@ export class PDF2zhHelperFactory {
             );
             onProgress?.({ phase: "importing", fileName, endpoint });
             await this.handleResponse(response, item, config);
-            onProgress?.({ phase: "file-done", fileName, endpoint });
+            onProgress?.({
+                phase: "file-done",
+                fileName,
+                endpoint,
+                warning: translationWarning(response),
+            });
         } catch (error) {
             ztoolkit.log(`处理单个文件失败: ${fileName}, 错误: ${error}`);
             const message =
@@ -437,53 +450,7 @@ export class PDF2zhHelperFactory {
         task: Record<string, unknown> | undefined,
         taskId: string,
     ): { status: string; message?: string; [key: string]: unknown } | null {
-        if (!task || Array.isArray(task.tasks) || Array.isArray(task.history)) {
-            return null;
-        }
-        const id = this.taskIdFromPayload(task);
-        if (!id || id !== taskId) {
-            return null;
-        }
-        const nested =
-            task.result && typeof task.result === "object"
-                ? (task.result as Record<string, unknown>)
-                : null;
-        const status = String(task.status || nested?.status || "");
-        const failed =
-            status === "失败" ||
-            status === "failed" ||
-            nested?.status === "error" ||
-            (task.finished === true &&
-                status !== "完成" &&
-                status !== "success");
-        if (failed) {
-            return {
-                status: "error",
-                message: String(
-                    nested?.message || task.error || task.message || "翻译失败",
-                ),
-            };
-        }
-        const files = this.stringList(nested?.fileList ?? task.fileList);
-        const paths = this.stringList(nested?.filePaths ?? task.filePaths);
-        const succeeded =
-            (task.finished === true ||
-                status === "完成" ||
-                status === "success" ||
-                nested?.status === "success") &&
-            (files.length > 0 || paths.length > 0);
-        if (!succeeded) {
-            return null;
-        }
-        if (nested && nested.status === "success" && files.length > 0) {
-            return nested as { status: string; message?: string };
-        }
-        return {
-            status: "success",
-            fileList: files,
-            filePaths: paths,
-            outputDir: String(nested?.outputDir || task.outputDir || ""),
-        };
+        return completedTaskPayload(task, taskId);
     }
 
     static taskFinishedWithoutFiles(
@@ -1165,6 +1132,7 @@ class JobProgressPopup {
     private total: number;
     private done = 0;
     private finishedFiles = new Set<number>();
+    private warnedFiles = new Set<number>();
     private enabled: boolean;
 
     static shouldShow(): boolean {
@@ -1272,6 +1240,9 @@ class JobProgressPopup {
         if (idx === undefined) {
             return;
         }
+        if (update.phase === "file-done" && update.warning) {
+            this.warnedFiles.add(update.current);
+        }
         const fileProgress = PDF2zhHelperFactory.jobProgressPercent({
             ...update,
             current: 1,
@@ -1282,7 +1253,7 @@ class JobProgressPopup {
             type:
                 update.phase === "file-failed"
                     ? "error"
-                    : update.phase === "file-done"
+                    : update.phase === "file-done" && !update.warning
                       ? "success"
                       : "default",
             progress: fileProgress,
@@ -1325,22 +1296,29 @@ class JobProgressPopup {
             return;
         }
         this.changeLine(this.summaryIdx, {
-            text: getString("operation-batch-completed", {
-                args: {
-                    succeeded,
-                    failed,
-                    kind:
-                        failed > 0 && succeeded === 0
-                            ? "failed"
-                            : failed > 0
-                              ? "mixed"
-                              : "success",
-                },
-            }),
+            text:
+                getString("operation-batch-completed", {
+                    args: {
+                        succeeded,
+                        failed,
+                        kind:
+                            failed > 0 && succeeded === 0
+                                ? "failed"
+                                : failed > 0
+                                  ? "mixed"
+                                  : "success",
+                    },
+                }) +
+                (this.warnedFiles.size
+                    ? " · " +
+                      getString("operation-batch-warnings", {
+                          args: { count: this.warnedFiles.size },
+                      })
+                    : ""),
             type:
                 failed > 0 && succeeded === 0
                     ? "error"
-                    : failed > 0
+                    : failed > 0 || this.warnedFiles.size > 0
                       ? "default"
                       : "success",
             progress: 100,
@@ -1354,7 +1332,7 @@ class JobProgressPopup {
             return;
         }
         const token = ++shared.closeToken;
-        Zotero.Promise.delay(8000).then(() => {
+        Zotero.Promise.delay(this.warnedFiles.size ? 30000 : 8000).then(() => {
             if (
                 !JobProgressPopup.shared ||
                 JobProgressPopup.shared.closeToken !== token ||
