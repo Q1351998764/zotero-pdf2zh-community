@@ -8,16 +8,12 @@ import threading
 
 from utils.deepseek_thinking import prepare_deepseek_runtime_command
 from utils.diagnostics import (
-    MAX_LINE_CHARS, TaskDiagnostics, TranslationProcessError, collect_secrets,
+    MAX_LINE_CHARS, TaskDiagnostics, TranslationProcessError, collect_secrets, safe_message,
 )
 from utils.environment_lifecycle import managed_python_env
+from utils.progress_output import ProgressSampler, parse_progress_line
 from utils.task_manager import task_manager
 
-MAIN_PROGRESS_RE = re.compile(r"\btranslate\s+[^a-z\(\)\r\n]*?(\d+)/(\d+)\b", re.I)
-STEP_PROGRESS_RE = re.compile(r"(.+?)\(\d+/\d+\)\s+.*?(\d+)/(\d+)")
-LEGACY_PROGRESS_RE = re.compile(r"(?:translate|Running|Parse).*?(\d+)/(\d+)", re.I)
-PDF2ZH_TQDM_RE = re.compile(r"\|\s*(\d+)/(\d+)\s+\[")
-ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _CONSOLE_LOCK = threading.Lock()
 
 
@@ -35,7 +31,10 @@ def _apply_terminal_size_env(env, cols, rows):
 
 
 def _child_terminal_size(cols, rows):
-    return max(40, int(cols) - 1), max(10, int(rows))
+    # The child writes to a pipe, not the visible terminal. Give Rich enough
+    # virtual width to keep counters intact beside its longest stage names;
+    # only short sampled snapshots are printed in the user's actual window.
+    return max(200, int(cols) - 1), max(10, int(rows))
 
 
 def execute_with_progress(cmd, task_id, args, env_manager, *, cwd=None):
@@ -60,35 +59,6 @@ def execute_with_progress(cmd, task_id, args, env_manager, *, cwd=None):
     return _execute_with_inherit(final_cmd, final_env, task_id, cols, **kwargs)
 
 
-def _parse_progress(text, task_id):
-    if task_id is None:
-        return
-    clean = ANSI_ESCAPE.sub("", text)
-    match = MAIN_PROGRESS_RE.search(clean)
-    if match:
-        current, total = map(int, match.groups())
-        if total > 0:
-            task_manager.update_task(task_id, {
-                "progress": min(99, int(current / total * 100)), "status": "running",
-                "message": f"translate {current}/{total}",
-            })
-        return
-    match = STEP_PROGRESS_RE.search(clean)
-    if match:
-        task_manager.update_task(task_id, {"status": "running", "message": match.group(1).strip()[:200]})
-        return
-    matches = PDF2ZH_TQDM_RE.findall(clean)
-    match = LEGACY_PROGRESS_RE.search(clean)
-    pair = matches[-1] if matches else (match.groups() if match else None)
-    if pair:
-        current, total = map(int, pair)
-        if total > 0:
-            task_manager.update_task(task_id, {
-                "progress": min(99, int(current / total * 100)), "status": "running",
-                "message": f"translate {current}/{total}",
-            })
-
-
 def _execute_captured(final_cmd, final_env, task_id, *, cwd=None, log_dir=None):
     diagnostic = TaskDiagnostics(task_id, collect_secrets(final_cmd, final_env), log_dir=log_dir)
     task_manager.update_task(task_id, {"logFile": diagnostic.path.name, "logPath": str(diagnostic.path)})
@@ -96,9 +66,10 @@ def _execute_captured(final_cmd, final_env, task_id, *, cwd=None, log_dir=None):
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     pending = ""
     oversized = False
+    progress = ProgressSampler()
 
-    def consume(line):
-        safe = diagnostic.record(line)
+    def emit(line, *, progress_snapshot=False):
+        safe = diagnostic.record_progress(line) if progress_snapshot else diagnostic.record(line)
         if safe:
             # One atomic line with task identity avoids mixing concurrent output.
             with _CONSOLE_LOCK:
@@ -106,7 +77,19 @@ def _execute_captured(final_cmd, final_env, task_id, *, cwd=None, log_dir=None):
                     print(f"[{diagnostic.task_id[:8]}] {safe}", flush=True)
                 except (OSError, UnicodeError):
                     pass
-            _parse_progress(safe, task_id)
+
+    def consume(line):
+        record = parse_progress_line(safe_message(line, diagnostic.secrets))
+        if record is not None:
+            updates = progress.update(record)
+            if updates and task_id is not None:
+                task_manager.update_task(task_id, updates)
+            # Live task state is independent of terminal/log sampling. Rich
+            # redraws every old stage on each tick; never persist those frames.
+            emit(progress.snapshot(), progress_snapshot=True)
+        else:
+            # Warning/error output bypasses progress sampling completely.
+            emit(line)
 
     def feed(text):
         nonlocal pending, oversized
@@ -138,11 +121,13 @@ def _execute_captured(final_cmd, final_env, task_id, *, cwd=None, log_dir=None):
         feed(decoder.decode(b"", final=True))
         if pending and not oversized:
             consume(pending)
+        emit(progress.snapshot(force=True), progress_snapshot=True)
         result = diagnostic.finish(process.wait())
     except BaseException as exc:
         if process is not None and process.poll() is None:
             process.kill()
             process.wait()
+        emit(progress.snapshot(force=True), progress_snapshot=True)
         diagnostic.record(f"{type(exc).__name__}: {exc}")
         result = diagnostic.finish(-1)
         task_manager.update_task(task_id, {

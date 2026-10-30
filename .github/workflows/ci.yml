@@ -97,6 +97,8 @@ jobs:
               'test_asset_downloads.py',
               'test_engine_logging.py',
               'test_rich_text_compat.py',
+              'test_progress_output.py',
+              'test_progress_output_integration.py',
           ))
           result = unittest.TextTestRunner(verbosity=2).run(suite)
           if not result.wasSuccessful() or result.skipped:

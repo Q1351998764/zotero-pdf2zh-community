@@ -90,6 +90,18 @@ class TaskDiagnosticsTests(unittest.TestCase):
             self.assertTrue(all(path.stat().st_size <= 512 for path in files))
             self.assertTrue(Path(result.log_path).exists())
 
+    def test_sampled_progress_keeps_redaction_and_deduplication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = TaskDiagnostics("snapshot", ("private-provider-key",), log_dir=directory)
+            snapshot = "Download private-provider-key 1/2"
+            self.assertEqual(diagnostic.record_progress(snapshot), "Download [REDACTED] 1/2")
+            self.assertEqual(diagnostic.record_progress(snapshot), "")
+            self.assertEqual(diagnostic.record("private paper paragraph"), "")
+            result = diagnostic.finish(0)
+            text = Path(result.log_path).read_text(encoding="utf-8")
+            self.assertNotIn("private-provider-key", text)
+            self.assertEqual(text.count("Download [REDACTED] 1/2"), 1)
+
     def test_config_and_environment_secrets_are_recognized(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "config.json"

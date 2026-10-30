@@ -92,7 +92,7 @@ def build(destination):
     with zipfile.ZipFile(destination / 'server.zip') as archive:
         names = archive.namelist()
         assert 'server/engine_runner.py' in names and 'server/start-server.bat' in names
-        for required in ('utils/engine_compat.py', 'utils/asset_repair.py', 'utils/asset_downloads.py', 'utils/diagnostics.py', 'utils/engine_logging.py', 'utils/rich_text_compat.py', 'warmup/install_managed.py', 'config/venv.json.example'):
+        for required in ('utils/engine_compat.py', 'utils/asset_repair.py', 'utils/asset_downloads.py', 'utils/diagnostics.py', 'utils/engine_logging.py', 'utils/progress_output.py', 'utils/rich_text_compat.py', 'warmup/install_managed.py', 'config/venv.json.example'):
             assert 'server/' + required in names, required
         assert not any(name in names for name in ('server/config/config.toml', 'server/config/config.json', 'server/config/venv.json'))
         assert not any('/logs/' in name or '/translated/' in name for name in names)

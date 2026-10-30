@@ -1,4 +1,4 @@
-## server.py v4.1.9
+## server.py v4.1.10
 # guaguastandup
 # zotero-pdf2zh
 import os
@@ -40,8 +40,8 @@ from utils.diagnostics import missing_output_error, record_task_error, safe_mess
 
 _VALUE_ERROR_RE = re.compile(r'(?m)^ValueError:\s*(?P<msg>.+)$')
 
-__version__ = "4.1.9"
-update_log = "社区维护版：改进首次翻译的模型与字体下载，失败自动切换备用源；保留完整脱敏错误记录；兼容富文本样式标签的双引号写法。请同时更新插件和 Server。"
+__version__ = "4.1.10"
+update_log = "社区维护版：修复终端进度反复刷屏，约每两秒显示一条简短状态；任务进度仍实时更新，警告与错误即时显示。本次修复只需更新 Server，已有 XPI 可继续使用。"
 
 ############# config file #########
 pdf2zh      = 'pdf2zh'

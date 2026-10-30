@@ -13,6 +13,7 @@ import threading
 import time
 from urllib.parse import urlsplit, urlunsplit
 import uuid
+from utils.progress_output import parse_progress_line
 
 LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
 MAX_LOG_BYTES = 512 * 1024
@@ -36,7 +37,6 @@ _PAYLOAD = re.compile(r'''(?ix)(?:["']?(?:
 )["']?\s*[:=])''')
 _EXCEPTION = re.compile(r"\b(?:[\w.]+(?:Error|Exception)|ReadTimeout|ConnectTimeout|TimeoutError)\s*:")
 _DIAGNOSTIC = re.compile(r"\b(?:ERROR|WARNING|WARN|CRITICAL|FATAL|Traceback)\b|^\s*(?:error|failed|failure|timeout|timed out|retry)\b|^[⚠️❌\s]*(?:失败|错误|超时|重试)")
-_PROGRESS = re.compile(r"\b(?:translate|Running|Parse)\b.{0,100}\d+/\d+|\|\s*\d+/\d+\s+\[", re.I)
 _ASSET_STATUS = re.compile(r"^\[asset_download\] (?:INFO|WARNING|ERROR)\b")
 
 
@@ -242,6 +242,17 @@ class TaskDiagnostics:
                 handle.write(encoded)
 
     def record(self, line):
+        return self._record(line)
+
+    def record_progress(self, snapshot):
+        """Record a parsed progress snapshot, still applying all redaction.
+
+        Normalized snapshots no longer have the original Rich/tqdm syntax.
+        Only the progress sampler should use this explicit entry point.
+        """
+        return self._record(snapshot, is_progress=True)
+
+    def _record(self, line, *, is_progress=False):
         line = str(line).strip()
         structured = line.startswith(ENGINE_DIAGNOSTIC_PREFIX)
         if structured:
@@ -252,8 +263,9 @@ class TaskDiagnostics:
             return ""
         # Source text, Rich traceback local-variable dumps and full configs are
         # intentionally excluded. This is a diagnostic log, not a raw transcript.
-        if not (structured or _ASSET_STATUS.match(line)
-                or _DIAGNOSTIC.search(line[:180]) or _EXCEPTION.search(line[:180]) or _PROGRESS.search(line)
+        if not (is_progress or structured or _ASSET_STATUS.match(line)
+                or _DIAGNOSTIC.search(line[:180]) or _EXCEPTION.search(line[:180])
+                or parse_progress_line(line) is not None
                 or re.search(r'HTTP(?: Request:|/\d).*?\b[45]\d\d\b', line)
                 or re.match(r'^File "[^\"]+", line \d+', line)):
             return ""
