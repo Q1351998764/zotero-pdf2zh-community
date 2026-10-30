@@ -99,6 +99,7 @@ jobs:
               'test_rich_text_compat.py',
               'test_progress_output.py',
               'test_progress_output_integration.py',
+              'test_partial_translation_failure.py',
           ))
           result = unittest.TextTestRunner(verbosity=2).run(suite)
           if not result.wasSuccessful() or result.skipped:

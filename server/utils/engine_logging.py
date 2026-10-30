@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import uuid
 
 from utils.diagnostics import ENGINE_DIAGNOSTIC_PREFIX, MAX_LINE_CHARS, safe_message
 
@@ -30,13 +31,30 @@ class _EngineDiagnosticHandler(logging.Handler):
                 detail = safe_message(f"{type(exception).__name__}: {exception}").splitlines()[0]
                 if detail not in message:
                     message += " | " + detail
-            event = {"level": record.levelname, "logger": record.name, "message": message}
+            # pdf2zh-next forwards worker LogRecords through a QueueHandler.
+            # Keep one identity on the record so the parent's copy cannot
+            # count the same failed paragraph twice.
+            event_id = getattr(record, "_pdf2zh_diagnostic_event_id", None)
+            if event_id is None:
+                event_id = uuid.uuid4().hex
+                record._pdf2zh_diagnostic_event_id = event_id
+            event = {"level": record.levelname, "logger": record.name,
+                     "message": message, "event_id": event_id}
             line = ENGINE_DIAGNOSTIC_PREFIX + json.dumps(event, ensure_ascii=False)
             if len(line) > MAX_LINE_CHARS:
-                event["message"] = "过长的诊断消息已省略（可能包含请求/正文）。"
+                final_failure = (
+                    record.name == "babeldoc.format.pdf.document_il.midend.il_translator"
+                    and record.levelno >= logging.ERROR
+                    and message.startswith("Error translating paragraph.")
+                )
+                event["message"] = (
+                    ("Error translating paragraph. " if final_failure else "")
+                    + "过长的诊断消息已省略（可能包含请求/正文）。"
+                )
                 line = ENGINE_DIAGNOSTIC_PREFIX + json.dumps(event, ensure_ascii=False)
-            # One write prevents Rich from applying terminal width or styling.
-            sys.stderr.write(line + "\n")
+            # Start a fresh record even if Rich just wrote a CR repaint with
+            # no trailing newline. One write keeps our envelope intact.
+            sys.stderr.write("\n" + line + "\n")
             sys.stderr.flush()
         except Exception:
             # logging.Handler.handleError prints raw records/arguments, so do

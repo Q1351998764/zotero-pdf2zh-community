@@ -60,6 +60,38 @@ class TaskFailureAPITests(unittest.TestCase):
             self.assertNotIn("200 OK", response.get_json()["message"])
             self.assertEqual(response.get_json()["logFile"], "api_missing.log")
 
+    def test_partial_pdf_with_final_paragraph_failure_is_not_returned_as_success(self):
+        translator = self.translator_type.__new__(self.translator_type)
+        app = Flask(__name__)
+        with tempfile.TemporaryDirectory() as directory, contextlib.redirect_stdout(io.StringIO()):
+            output = Path(directory) / "partial.pdf"
+            script = (
+                f"import sys; sys.path.insert(0, {str(SERVER)!r}); "
+                "import logging; from pathlib import Path; "
+                "from utils.engine_logging import install_engine_diagnostics; "
+                "install_engine_diagnostics(); "
+                "logging.getLogger('babeldoc.format.pdf.document_il.midend.il_translator')"
+                ".error('Error translating paragraph. ConnectionError: Connection error.'); "
+                f"Path({str(output)!r}).write_bytes(b'%PDF-1.4\\n%%EOF\\n')"
+            )
+
+            def worker():
+                _execute_captured([sys.executable, "-c", script],
+                                  {**os.environ, "PYTHONIOENCODING": "utf-8"},
+                                  "api_partial", log_dir=directory)
+                return translator._complete_job_files("api_partial", [str(output)], "done")
+
+            with app.test_request_context("/translate", json={}), patch.object(task_manager, "_delayed_remove"):
+                response, code = translator._start_accepted_job("api_partial", {"active": True}, worker, "/translate")
+            self.assertTrue(output.exists())
+            self.assertEqual(code, 500)
+            payload = response.get_json()
+            self.assertEqual(payload["exitCode"], 1)
+            self.assertIn("1 个段落翻译失败", payload["message"])
+            history = next(item for item in task_manager.get_history() if item["taskId"] == "api_partial")
+            self.assertEqual(history["status"], "failed")
+            self.assertNotIn("fileList", history)
+
 
 if __name__ == "__main__":
     unittest.main()

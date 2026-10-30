@@ -12,13 +12,22 @@ from unittest.mock import patch
 SERVER = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SERVER))
 
-from utils.diagnostics import (TaskDiagnostics, TranslationProcessError,
+from utils.diagnostics import (ENGINE_DIAGNOSTIC_PREFIX, IncompleteTranslationError,
+                               TaskDiagnostics, TranslationProcessError,
                                collect_secrets, missing_output_error, redact)
 from utils.execute import _execute_captured
 from utils.task_manager import TaskManager, task_manager
 
 
 class TaskDiagnosticsTests(unittest.TestCase):
+    @staticmethod
+    def engine_event(message, *, level="ERROR", logger="babeldoc.format.pdf.document_il.midend.il_translator",
+                     event_id=None, **extra):
+        event = {"level": level, "logger": logger, "message": message, **extra}
+        if event_id is not None:
+            event["event_id"] = event_id
+        return ENGINE_DIAGNOSTIC_PREFIX + json.dumps(event)
+
     def run_child(self, directory, task_id, script, **env_extra):
         task_manager.add_task(task_id, {"taskId": task_id, "active": True, "progress": 0})
         return _execute_captured(
@@ -89,6 +98,85 @@ class TaskDiagnosticsTests(unittest.TestCase):
             self.assertEqual(len(files), 2)
             self.assertTrue(all(path.stat().st_size <= 512 for path in files))
             self.assertTrue(Path(result.log_path).exists())
+
+    def test_final_paragraph_failures_count_before_text_dedup_and_stay_redacted(self):
+        secret = "private-provider-key"
+        message = f"Error translating paragraph. APIConnectionError: {secret}"
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = TaskDiagnostics("final_failures", (secret,), log_dir=directory)
+            first = self.engine_event(message, event_id="a" * 32)
+            self.assertIn("[REDACTED]", diagnostic.record(first))
+            self.assertEqual(diagnostic.record(first), "")
+            self.assertEqual(diagnostic.failed_paragraphs, 1)
+            # The second paragraph has the same safe text, but is a new event.
+            self.assertEqual(diagnostic.record(self.engine_event(message, event_id="b" * 32)), "")
+            diagnostic.record(self.engine_event(message, level="CRITICAL", event_id="c" * 32))
+            # Rich's plain replay must not count again.
+            diagnostic.record("ERROR:babeldoc.format.pdf.document_il.midend.il_translator:" + message)
+            result = diagnostic.finish(0)
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.failed_paragraphs, 3)
+            self.assertIn("3 个段落翻译失败", result.summary)
+            self.assertIn("APIConnectionError", result.summary)
+            error = IncompleteTranslationError(result)
+            self.assertIsInstance(error, TranslationProcessError)
+            self.assertEqual(error.returncode, 1)
+            self.assertEqual(error.failed_paragraphs, 3)
+            self.assertEqual(error.log_path, result.log_path)
+            self.assertEqual(str(error), result.summary)
+            text = Path(result.log_path).read_text(encoding="utf-8") + str(error)
+            self.assertNotIn(secret, text)
+            self.assertIn("exit=0 paragraph_failures=3", text)
+
+    def test_recoverable_fallbacks_retries_and_invalid_envelopes_do_not_count(self):
+        message = "Error translating paragraph. APIConnectionError: Connection error."
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = TaskDiagnostics("recoverable", log_dir=directory)
+            diagnostic.record(self.engine_event(message, logger="babeldoc.format.pdf.document_il.midend.il_translator_llm_only"))
+            diagnostic.record(self.engine_event(message, level="WARNING"))
+            diagnostic.record(self.engine_event("Connection error; retrying request"))
+            diagnostic.record(self.engine_event(message, logger="babeldoc.assets.assets"))
+            diagnostic.record("WARNING HTTP/1.1 503 request will be retried")
+            for invalid in (
+                self.engine_event(message, event_id="invalid"),
+                self.engine_event(message, event_id=3),
+                self.engine_event(message, extra_field="not allowed"),
+                self.engine_event(message + "\nprivate paragraph"),
+                self.engine_event(message, level="INFO"),
+            ):
+                self.assertEqual(diagnostic.record(invalid), "")
+            result = diagnostic.finish(0)
+            self.assertEqual(result.failed_paragraphs, 0)
+            self.assertNotIn("任务未完成", result.summary)
+            self.assertNotIn("paragraph_failures", Path(result.log_path).read_text(encoding="utf-8"))
+
+    def test_legacy_three_field_final_failure_envelopes_remain_supported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = TaskDiagnostics("legacy_final", log_dir=directory)
+            event = self.engine_event("Error translating paragraph. APIConnectionError: Connection error.")
+            diagnostic.record(event)
+            diagnostic.record(event)
+            result = diagnostic.finish(0)
+            self.assertEqual(result.failed_paragraphs, 2)
+
+    def test_final_failure_count_and_cause_survive_rotation_and_tail_eviction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = TaskDiagnostics("failure_rotate", log_dir=directory, max_bytes=1024)
+            event = self.engine_event("Error translating paragraph. APIConnectionError: Connection error.",
+                                      event_id="d" * 32)
+            diagnostic.record(event)
+            for number in range(120):
+                diagnostic.record(f"ValueError: unrelated later diagnostic {number} " + "x" * 80)
+            # A delayed parent-process replay still cannot count twice.
+            self.assertEqual(diagnostic.record(event), "")
+            result = diagnostic.finish(0)
+            self.assertEqual(result.failed_paragraphs, 1)
+            self.assertNotIn("APIConnectionError", result.tail)
+            self.assertIn("APIConnectionError", result.summary)
+            files = list(Path(directory).glob("*.log*"))
+            self.assertEqual(len(files), 2)
+            self.assertTrue(all(path.stat().st_size <= 1024 for path in files))
+            self.assertIn("paragraph_failures=1", Path(result.log_path).read_text(encoding="utf-8"))
 
     def test_sampled_progress_keeps_redaction_and_deduplication(self):
         with tempfile.TemporaryDirectory() as directory:

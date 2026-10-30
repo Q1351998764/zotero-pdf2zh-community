@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import logging
+from logging.handlers import QueueHandler
 import os
 from pathlib import Path
 import sys
@@ -30,7 +31,7 @@ class EngineLoggingTest(unittest.TestCase):
                 "Network error occurred: Client error '404 Not Found' for url '%s' opaque=%s",
                 url, key,
             )
-        records = stream.getvalue().splitlines()
+        records = [line for line in stream.getvalue().splitlines() if line]
         self.assertEqual(len(records), 1)
         with tempfile.TemporaryDirectory() as directory:
             diagnostic = TaskDiagnostics("resource", secrets=(key,), log_dir=directory)
@@ -116,6 +117,45 @@ for warning in {warnings!r}:
         with contextlib.redirect_stderr(io.StringIO()) as stream:
             logging.getLogger("babeldoc.assets.assets").warning("download failed")
         self.assertEqual(stream.getvalue().count(ENGINE_DIAGNOSTIC_PREFIX), 1)
+
+    def test_queue_forwarded_record_retains_one_failure_identity(self):
+        logger = logging.getLogger("babeldoc.format.pdf.document_il.midend.il_translator")
+        record = logger.makeRecord(logger.name, logging.ERROR, __file__, 0,
+                                   "Error translating paragraph. Paragraph: PRIVATE", (), None)
+        with contextlib.redirect_stderr(io.StringIO()) as stream:
+            logger.handle(record)
+            copied = QueueHandler(None).prepare(record)
+            logging.getLogger("pdf2zh_next.high_level").handle(copied)
+        lines = [line for line in stream.getvalue().splitlines()
+                 if line.startswith(ENGINE_DIAGNOSTIC_PREFIX)]
+        self.assertEqual(len(lines), 2)
+        events = [json.loads(line[len(ENGINE_DIAGNOSTIC_PREFIX):]) for line in lines]
+        self.assertEqual(events[0]["event_id"], events[1]["event_id"])
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = TaskDiagnostics("queue-copy", log_dir=directory)
+            for line in lines:
+                diagnostic.record(line)
+            result = diagnostic.finish(0)
+        self.assertEqual(result.failed_paragraphs, 1)
+        self.assertNotIn("PRIVATE", result.summary)
+
+    def test_oversized_exception_cannot_hide_final_paragraph_failure(self):
+        with contextlib.redirect_stderr(io.StringIO()) as stream:
+            try:
+                raise RuntimeError("X" * 5000 + "PRIVATE_EXCEPTION")
+            except RuntimeError:
+                logging.getLogger("babeldoc.format.pdf.document_il.midend.il_translator").exception(
+                    "Error translating paragraph. Paragraph: PRIVATE_BODY"
+                )
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostic = TaskDiagnostics("long-error", log_dir=directory)
+            for line in stream.getvalue().splitlines():
+                diagnostic.record(line)
+            result = diagnostic.finish(0)
+        self.assertEqual(result.failed_paragraphs, 1)
+        self.assertIn("过长的诊断消息已省略", result.summary)
+        self.assertNotIn("PRIVATE", stream.getvalue())
+        self.assertNotIn("X" * 100, result.tail)
 
     def test_invalid_envelopes_are_discarded_not_logged_as_raw_payload(self):
         payloads = [

@@ -8,7 +8,8 @@ import threading
 
 from utils.deepseek_thinking import prepare_deepseek_runtime_command
 from utils.diagnostics import (
-    MAX_LINE_CHARS, TaskDiagnostics, TranslationProcessError, collect_secrets, safe_message,
+    MAX_LINE_CHARS, IncompleteTranslationError, TaskDiagnostics,
+    TranslationProcessError, collect_secrets, safe_message,
 )
 from utils.environment_lifecycle import managed_python_env
 from utils.progress_output import ProgressSampler, parse_progress_line
@@ -141,6 +142,10 @@ def _execute_captured(final_cmd, final_env, task_id, *, cwd=None, log_dir=None):
     })
     if result.returncode:
         raise TranslationProcessError(result.returncode, result)
+    if result.failed_paragraphs:
+        # BabelDOC may keep the source paragraph and still create PDFs/exit 0.
+        # A file's existence alone does not make that an accepted translation.
+        raise IncompleteTranslationError(result)
     return result
 
 

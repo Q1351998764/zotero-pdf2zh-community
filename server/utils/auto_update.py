@@ -281,18 +281,75 @@ def _version_from_json_release(payload):
 def _latest_version_from_github():
     # main can contain an unreleased version. Offer only a release that has
     # a downloadable server archive, never source-only development commits.
-    payload_bytes, content_type = _http_get(
-        f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest",
-        timeout=15,
-    )
-    if _payload_is_html(payload_bytes, content_type):
-        raise RuntimeError("GitHub API 返回了 HTML")
-    release = json.loads(payload_bytes.decode("utf-8"))
+    try:
+        payload_bytes, content_type = _http_get(
+            f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest",
+            timeout=15,
+        )
+        if _payload_is_html(payload_bytes, content_type):
+            raise ValueError("GitHub API 返回了 HTML")
+        release = json.loads(payload_bytes.decode("utf-8"))
+        if not isinstance(release, dict):
+            raise ValueError("GitHub API 返回了无效的发布信息")
+    except (OSError, ValueError) as exc:
+        # Public Release assets do not use the unauthenticated REST API quota.
+        # Use the latest stable release, never main or another repository.
+        print(f"  - ⚠️ GitHub API 查询失败: {exc}；尝试公开发布资源。")
+        return _latest_version_from_public_release()
     version = _version_from_json_release(release)
     if release.get("draft") or release.get("prerelease") or not re.fullmatch(r"\d+\.\d+\.\d+", version):
         raise RuntimeError("没有可安装的社区版正式发布")
     if not any(asset.get("name") == "server.zip" for asset in release.get("assets", [])):
         raise RuntimeError("最新发布没有 server.zip，暂不提供自动更新")
+    return version
+
+
+def _verify_server_release_asset(version):
+    """Check availability without downloading an archive on every startup."""
+    url = _server_download_urls(OWNER, REPO, version, "github")[0]
+    request = urllib.request.Request(
+        url, method="HEAD", headers={"User-Agent": USER_AGENT, "Accept": "application/octet-stream"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        content_type = response.headers.get("Content-Type", "")
+        if response.status != 200 or _payload_is_html(b"", content_type):
+            raise RuntimeError("公开发布的 server.zip 不可用或返回了 HTML")
+        if response.headers.get("Content-Length") == "0":
+            raise RuntimeError("公开发布的 server.zip 为空")
+
+
+def _latest_version_from_public_release():
+    """Validate the versioned, published Zotero metadata and matching Server."""
+    payload_bytes, content_type = _http_get(
+        f"https://github.com/{OWNER}/{REPO}/releases/latest/download/update.json",
+        timeout=15,
+    )
+    if _payload_is_html(payload_bytes, content_type):
+        raise RuntimeError("公开发布的更新清单返回了 HTML")
+    try:
+        metadata = json.loads(payload_bytes.decode("utf-8"))
+    except (UnicodeError, ValueError) as exc:
+        raise RuntimeError("公开发布的更新清单不是有效 JSON") from exc
+    addon_id = "pdf2zh-community@q1351998764.github.io"
+    addons = metadata.get("addons") if isinstance(metadata, dict) else None
+    if not isinstance(addons, dict) or set(addons) != {addon_id}:
+        raise RuntimeError("公开发布的更新清单不属于本社区插件")
+    addon = addons[addon_id]
+    updates = addon.get("updates") if isinstance(addon, dict) else None
+    if not isinstance(updates, list) or len(updates) != 1 or not isinstance(updates[0], dict):
+        raise RuntimeError("公开发布的更新清单版本列表无效")
+    update = updates[0]
+    version = update.get("version")
+    if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise RuntimeError("公开发布的更新清单没有有效的正式版本")
+    expected_link = (
+        f"https://github.com/{OWNER}/{REPO}/releases/download/"
+        f"v{version}/zotero-pdf2zh-community.xpi"
+    )
+    if update.get("update_link") != expected_link:
+        raise RuntimeError("公开发布的更新清单链接与本仓库版本不匹配")
+    _verify_server_release_asset(version)
+    print("  - 已通过公开发布资源确认 Server 版本。")
     return version
 
 

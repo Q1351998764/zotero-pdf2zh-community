@@ -40,27 +40,51 @@ _DIAGNOSTIC = re.compile(r"\b(?:ERROR|WARNING|WARN|CRITICAL|FATAL|Traceback)\b|^
 _ASSET_STATUS = re.compile(r"^\[asset_download\] (?:INFO|WARNING|ERROR)\b")
 
 
-def decode_engine_diagnostic(line, secrets=()):
-    """Decode our pre-Rich record without accepting arbitrary JSON payloads.
-
-    The adapter emits only warning/error messages, not traceback locals, log
-    arguments or request objects. Redact again here using task-specific keys.
-    Invalid records are discarded instead of falling through as raw output.
-    """
+def _decode_engine_event(line):
+    """Validate the bounded warning/error envelope before using any fields."""
     try:
         event = json.loads(line[len(ENGINE_DIAGNOSTIC_PREFIX):])
     except (ValueError, TypeError):
-        return ""
-    if not isinstance(event, dict) or set(event) != {"level", "logger", "message"}:
-        return ""
+        return None
+    if not isinstance(event, dict) or set(event) not in (
+        {"level", "logger", "message"}, {"level", "logger", "message", "event_id"},
+    ):
+        return None
+    if "event_id" in event and (
+        not isinstance(event["event_id"], str)
+        or not re.fullmatch(r"[0-9a-f]{32}", event["event_id"])
+    ):
+        return None
     level, name, message = (event[key] for key in ("level", "logger", "message"))
     if not isinstance(level, str) or level not in {"WARNING", "ERROR", "CRITICAL"} or not isinstance(name, str):
-        return ""
+        return None
     if not re.fullmatch(r"(?:babeldoc|pdf2zh_next)(?:\.[A-Za-z0-9_]+)*", name):
-        return ""
+        return None
     if not isinstance(message, str) or len(message.splitlines()) > 1 or "\n" in message or "\r" in message:
-        return ""
-    return f"[engine] {level} {name}: {safe_message(message, secrets)}"[:MAX_LINE_CHARS]
+        return None
+    return event
+
+
+def _format_engine_event(event, secrets=()):
+    return (f"[engine] {event['level']} {event['logger']}: "
+            f"{safe_message(event['message'], secrets)}")[:MAX_LINE_CHARS]
+
+
+def decode_engine_diagnostic(line, secrets=()):
+    """Decode a validated pre-Rich record and apply task-specific redaction."""
+    event = _decode_engine_event(line)
+    return _format_engine_event(event, secrets) if event is not None else ""
+
+
+def _is_final_paragraph_failure(event):
+    # The LLM-only translator can recover through simple translation, so its
+    # errors and fallback notices must never be counted as final failures.
+    return (
+        event is not None
+        and event["logger"] == "babeldoc.format.pdf.document_il.midend.il_translator"
+        and event["level"] in {"ERROR", "CRITICAL"}
+        and event["message"].startswith("Error translating paragraph.")
+    )
 
 
 def redact(text, secrets=()):
@@ -174,6 +198,7 @@ class ExecutionResult:
     log_path: str
     summary: str
     tail: str
+    failed_paragraphs: int = 0
 
 
 class TranslationProcessError(subprocess.CalledProcessError):
@@ -185,6 +210,13 @@ class TranslationProcessError(subprocess.CalledProcessError):
 
     def __str__(self):
         return self.summary
+
+
+class IncompleteTranslationError(TranslationProcessError):
+    """The child exited zero after leaving failed paragraphs untranslated."""
+    def __init__(self, result):
+        super().__init__(1, result)
+        self.failed_paragraphs = result.failed_paragraphs
 
 
 class MissingOutputError(RuntimeError):
@@ -211,6 +243,9 @@ class TaskDiagnostics:
         self.lines = deque(maxlen=80)
         self.errors = deque(maxlen=40)
         self.last_line = None
+        self.failed_paragraphs = 0
+        self.paragraph_failure_summary = ""
+        self._paragraph_failure_ids = set()
         directory = Path(log_dir) if log_dir else LOG_DIR
         directory.mkdir(parents=True, exist_ok=True)
         filename = re.sub(r"[^a-zA-Z0-9_-]", "_", self.task_id)[:100] or str(uuid.uuid4())
@@ -256,7 +291,21 @@ class TaskDiagnostics:
         line = str(line).strip()
         structured = line.startswith(ENGINE_DIAGNOSTIC_PREFIX)
         if structured:
-            line = decode_engine_diagnostic(line, self.secrets)
+            event = _decode_engine_event(line)
+            line = _format_engine_event(event, self.secrets) if event is not None else ""
+            if _is_final_paragraph_failure(event):
+                event_id = event.get("event_id")
+                if event_id is not None:
+                    # QueueHandler forwards the worker's LogRecord to the
+                    # parent. Its second envelope is the same failure event.
+                    if event_id in self._paragraph_failure_ids:
+                        return ""
+                    self._paragraph_failure_ids.add(event_id)
+                # Different paragraphs often have identical redacted messages.
+                # Count actual structured events before display deduplication;
+                # Rich's plain-text replay never enters this branch.
+                self.failed_paragraphs += 1
+                self.paragraph_failure_summary = error_summary([line])
         else:
             line = safe_message(line, self.secrets).strip()
         if not line or line == self.last_line:
@@ -277,11 +326,20 @@ class TaskDiagnostics:
         return line
 
     def finish(self, returncode):
-        summary = error_summary(self.errors)
-        self._append(f"=== exit={returncode}" + (f" 摘要：{summary}" if summary else "") + " ===\n")
+        summary = self.paragraph_failure_summary or error_summary(self.errors)
+        failure_count = ""
+        if self.failed_paragraphs:
+            summary = (
+                f"有 {self.failed_paragraphs} 个段落翻译失败并保留原文，任务未完成。"
+                "可能生成的部分 PDF 保留在后端输出目录。"
+                + (f" 原因：{summary}" if summary else "")
+            )
+            failure_count = f" paragraph_failures={self.failed_paragraphs}"
+        self._append(f"=== exit={returncode}{failure_count}" + (f" 摘要：{summary}" if summary else "") + " ===\n")
         with _LOCK:
             _ACTIVE.discard(self.path)
-        return ExecutionResult(returncode, str(self.path), summary, "\n".join(self.lines)[-12000:])
+        return ExecutionResult(returncode, str(self.path), summary, "\n".join(self.lines)[-12000:],
+                               failed_paragraphs=self.failed_paragraphs)
 
 
 def record_task_error(task_id, exc):
